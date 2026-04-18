@@ -34,7 +34,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 
-from vrd_10bit_engine import (
+from tenbitredo_engine import (
     FFmpegHelper,
     SmartSave10Bit,
     VRDProjectParser,

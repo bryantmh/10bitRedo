@@ -1,5 +1,5 @@
 """
-VideoReDo 10-bit HEVC Companion — GUI
+10bitRedo - GUI
 
 A tkinter companion window that sits alongside VideoReDo TV Suite 6.
 Provides a "Save 10-bit HEVC" workflow that:
@@ -20,12 +20,12 @@ from pathlib import Path
 # Ensure our package is importable
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from vrd_10bit_engine import (
+from tenbitredo_engine import (
     FFmpegHelper, VideoInfo, Segment, SmartSave10Bit,
     VRDComBridge, VRDProjectParser, parse_manual_segments, cuts_to_kept,
 )
 
-log = logging.getLogger("vrd_10bit")
+log = logging.getLogger("tenbitredo")
 
 # ---------------------------------------------------------------------------
 #  Dark theme colours (matches video_standardizer.py)
@@ -64,7 +64,7 @@ class TextHandler(logging.Handler):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("VideoReDo 10-bit HEVC Companion")
+        self.title("10bitRedo")
         self.geometry("780x720")
         self.minsize(600, 500)
 
@@ -80,80 +80,10 @@ class App(tk.Tk):
         self._build_ui()
         self._setup_logging()
         self.after(20, self._apply_dark_titlebar)
-        log.info("VideoReDo 10-bit HEVC Companion ready.")
+        log.info("10bitRedo ready.")
         log.info("Workflow:  1) Open your 10-bit source in VideoReDo and make edits")
-        log.info("           2) Connect here via COM  —or—  save a .VPrj project file")
+        log.info("           2) Connect here via COM  -or-  save a .VPrj project file")
         log.info("           3) Choose output path and click Save 10-bit HEVC")
-
-    # -- Dark theme --------------------------------------------------------
-
-    def _apply_dark_theme(self):
-        self.configure(bg=_BG)
-        style = ttk.Style()
-        style.theme_use('clam')
-        style.configure('.',
-            background=_BG, foreground=_FG,
-            bordercolor=_BOR, focuscolor=_SEL, troughcolor=_BG2)
-        style.configure('TFrame', background=_BG)
-        style.configure('TLabel', background=_BG, foreground=_FG)
-        style.configure('TLabelframe', background=_BG, foreground=_FG,
-            bordercolor=_BOR)
-        style.configure('TLabelframe.Label', background=_BG,
-            foreground='#9ec9f5')
-        style.configure('TButton',
-            background=_ENT, foreground=_FG,
-            bordercolor=_BOR, relief='flat', padding=4)
-        style.map('TButton',
-            background=[('active', '#4c4c4c'), ('pressed', _SEL)],
-            foreground=[('active', _FG)])
-        style.configure('TEntry',
-            fieldbackground=_ENT, foreground=_FG,
-            insertcolor=_FG, bordercolor=_BOR,
-            selectbackground=_SEL, selectforeground=_FG)
-        style.configure('TSpinbox',
-            fieldbackground=_ENT, foreground=_FG,
-            insertcolor=_FG, bordercolor=_BOR,
-            arrowcolor=_FG, background=_ENT,
-            selectbackground=_SEL, selectforeground=_FG)
-        style.configure('TCombobox',
-            fieldbackground=_ENT, foreground=_FG,
-            insertcolor=_FG, bordercolor=_BOR,
-            arrowcolor=_FG, background=_ENT,
-            selectbackground=_SEL, selectforeground=_FG)
-        style.map('TCombobox',
-            fieldbackground=[('readonly', _ENT)],
-            foreground=[('readonly', _FG)])
-        style.configure('Horizontal.TProgressbar',
-            troughcolor=_ENT, background=_SEL,
-            bordercolor=_BOR, lightcolor=_SEL, darkcolor=_SEL)
-        style.configure('Vertical.TScrollbar',
-            troughcolor=_BG2, background=_ENT,
-            bordercolor=_BOR, arrowcolor=_FG)
-        style.configure('Horizontal.TScrollbar',
-            troughcolor=_BG2, background=_ENT,
-            bordercolor=_BOR, arrowcolor=_FG)
-        # Accent style for primary action button
-        style.configure('Accent.TButton',
-            background=_ACC, foreground='#ffffff',
-            bordercolor='#1177bb', relief='flat', padding=4)
-        style.map('Accent.TButton',
-            background=[('active', '#1177bb'), ('pressed', '#094771'),
-                        ('disabled', '#3a3a3a')],
-            foreground=[('disabled', '#777777')])
-
-    def _apply_dark_titlebar(self):
-        try:
-            self.update()
-            child_hwnd = self.winfo_id()
-            hwnd = ctypes.windll.user32.GetAncestor(child_hwnd, 2)
-            if not hwnd:
-                hwnd = child_hwnd
-            for attr in (20, 19):
-                ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                    hwnd, attr, ctypes.byref(ctypes.c_int(1)),
-                    ctypes.sizeof(ctypes.c_int))
-        except Exception:
-            pass
 
     # -- Dark theme --------------------------------------------------------
 
@@ -280,8 +210,10 @@ class App(tk.Tk):
         ttk.Label(seg_status, textvariable=self._seg_count_var,
                   foreground="gray").pack(side="left")
         self._auto_update_var = tk.StringVar(value="")
-        ttk.Label(seg_status, textvariable=self._auto_update_var,
-                  foreground="#4ec9b0").pack(side="right")
+        self._auto_update_label = ttk.Label(seg_status,
+                                             textvariable=self._auto_update_var,
+                                             foreground="#4ec9b0")
+        self._auto_update_label.pack(side="right")
 
         # ---- Output section ----
         out_frame = ttk.LabelFrame(main, text="Output", padding=6)
@@ -319,7 +251,7 @@ class App(tk.Tk):
         ttk.Label(row5, text="(Lower CRF = higher quality. 18 ≈ visually lossless)",
                   foreground="gray").pack(side="left")
 
-        # ---- Action ----
+        # ---- Action + Progress ----
         act_frame = ttk.Frame(main)
         act_frame.pack(fill="x", **pad)
         self._save_btn = ttk.Button(act_frame, text="▶  Save 10-bit HEVC",
@@ -334,6 +266,11 @@ class App(tk.Tk):
 
         self._pct_var = tk.StringVar(value="")
         ttk.Label(act_frame, textvariable=self._pct_var, width=6).pack(side="left")
+
+        # Live ffmpeg stats line (below progress bar)
+        self._status_label = ttk.Label(main, text="", font=("Consolas", 9),
+                                        foreground='#6a9fd8', anchor=tk.W)
+        self._status_label.pack(fill="x", padx=6, pady=(0, 2))
 
         # ---- Log ----
         log_frame = ttk.LabelFrame(main, text="Log", padding=4)
@@ -355,9 +292,9 @@ class App(tk.Tk):
         handler = TextHandler(self._log_text)
         handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s",
                                                 datefmt="%H:%M:%S"))
-        root_log = logging.getLogger("vrd_10bit")
+        root_log = logging.getLogger("tenbitredo")
         root_log.addHandler(handler)
-        root_log.setLevel(logging.DEBUG)
+        root_log.setLevel(logging.INFO)
 
     # -- ffmpeg init -------------------------------------------------------
 
@@ -412,7 +349,6 @@ class App(tk.Tk):
     def _connect_vrd(self):
         try:
             self._vrd = VRDComBridge()
-            log.info("Connecting to VideoReDo via COM (Dispatch)...")
             if self._vrd.connect():
                 try:
                     ver = self._vrd.get_version()
@@ -427,12 +363,7 @@ class App(tk.Tk):
                     self._probe_source()
                     log.info("Source file: %s", src)
                 else:
-                    log.info("Connected. Source file not auto-detected — "
-                             "please browse to it manually.")
-                # List available methods for debugging
-                methods = self._vrd.discover_methods()
-                if methods:
-                    log.debug("Available COM methods: %s", ", ".join(methods[:30]))
+                    log.info("Connected. Browse to source file manually.")
                 # Start auto-polling segments
                 self._start_segment_poll()
             else:
@@ -482,10 +413,8 @@ class App(tk.Tk):
         self._seg_count_var.set(f"{len(segments)} segment(s)")
 
     def _get_segments_from_ui(self) -> list:
-        """Parse segments from the text widget."""
         text = self._seg_text.get("1.0", tk.END)
-        segments = parse_manual_segments(text)
-        return segments
+        return parse_manual_segments(text)
 
     @staticmethod
     def _fmt_time(secs: float) -> str:
@@ -497,18 +426,18 @@ class App(tk.Tk):
     # -- Auto-update segments from VRD COM ---------------------------------
 
     def _start_segment_poll(self):
-        """Begin polling VideoReDo for segment changes every 2 seconds."""
         self._auto_update_var.set("● Auto-updating from VideoReDo")
+        self._auto_update_label.configure(foreground="#4ec9b0")
         self._poll_vrd_segments()
 
     def _stop_segment_poll(self):
         if self._poll_id is not None:
             self.after_cancel(self._poll_id)
             self._poll_id = None
-        self._auto_update_var.set("")
+        self._auto_update_var.set("● Disconnected from VideoReDo")
+        self._auto_update_label.configure(foreground="#f14c4c")
 
     def _poll_vrd_segments(self):
-        """Read segments from VRD COM and update UI if changed."""
         if self._working:
             self._poll_id = self.after(2000, self._poll_vrd_segments)
             return
@@ -527,7 +456,8 @@ class App(tk.Tk):
                     self._source_file = src
                     self._probe_source()
         except Exception:
-            pass  # COM might be temporarily unavailable
+            self._stop_segment_poll()
+            return
         self._poll_id = self.after(2000, self._poll_vrd_segments)
 
     # -- Output actions ----------------------------------------------------
@@ -551,7 +481,6 @@ class App(tk.Tk):
         if self._working:
             return
 
-        # Validate
         source = self._src_var.get().strip()
         output = self._out_var.get().strip()
 
@@ -572,7 +501,6 @@ class App(tk.Tk):
         if not self._ensure_ffmpeg():
             return
 
-        # Confirm overwrite
         if os.path.isfile(output):
             if not messagebox.askyesno("Overwrite?",
                     f"Output file already exists:\n{output}\n\nOverwrite?"):
@@ -582,8 +510,8 @@ class App(tk.Tk):
         self._save_btn.configure(state="disabled")
         self._progress_var.set(0)
         self._pct_var.set("0%")
+        self._status_label.configure(text="")
 
-        # Run in background thread
         t = threading.Thread(target=self._save_worker,
                              args=(source, segments, output), daemon=True)
         t.start()
@@ -594,6 +522,7 @@ class App(tk.Tk):
                                      crf=self._crf_var.get(),
                                      preset=self._preset_var.get())
             engine.set_progress_callback(self._on_progress)
+            engine.set_status_callback(self._on_status)
             engine.save(source, segments, output)
             self.after(0, lambda: messagebox.showinfo("Complete",
                 f"10-bit HEVC output saved:\n{output}"))
@@ -607,13 +536,20 @@ class App(tk.Tk):
     def _on_progress(self, pct: float, msg: str):
         self.after(0, self._update_progress, pct, msg)
 
+    def _on_status(self, status_line: str):
+        self.after(0, self._update_status, status_line)
+
     def _update_progress(self, pct: float, msg: str):
         self._progress_var.set(pct)
         self._pct_var.set(f"{pct:.0f}%")
 
+    def _update_status(self, status_line: str):
+        self._status_label.configure(text=status_line)
+
     def _save_done(self):
         self._working = False
         self._save_btn.configure(state="normal")
+        self._status_label.configure(text="")
 
 
 # ---------------------------------------------------------------------------
