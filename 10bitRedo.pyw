@@ -51,9 +51,22 @@ class TextHandler(logging.Handler):
         msg = self.format(record) + "\n"
         self.widget.after(0, self._append, msg)
 
+    @staticmethod
+    def _pick_tag(msg):
+        lo = msg.lower()
+        if "error" in lo:
+            return "err"
+        if "warning" in lo or "warn " in lo:
+            return "warn"
+        if "stream-cop" in lo or "copying" in lo:
+            return "copy"
+        if "re-encod" in lo:
+            return "encode"
+        return "normal"
+
     def _append(self, msg):
         self.widget.configure(state="normal")
-        self.widget.insert(tk.END, msg)
+        self.widget.insert(tk.END, msg, self._pick_tag(msg))
         self.widget.see(tk.END)
         self.widget.configure(state="disabled")
 
@@ -75,6 +88,10 @@ class App(tk.Tk):
         self._working = False
         self._poll_id = None
         self._last_seg_hash = ""
+        self._engine = None
+        self._cancel_event = None
+        self._progress_target = 0.0
+        self._animating = False
 
         self._apply_dark_theme()
         self._build_ui()
@@ -267,11 +284,6 @@ class App(tk.Tk):
         self._pct_var = tk.StringVar(value="")
         ttk.Label(act_frame, textvariable=self._pct_var, width=6).pack(side="left")
 
-        # Live ffmpeg stats line (below progress bar)
-        self._status_label = ttk.Label(main, text="", font=("Consolas", 9),
-                                        foreground='#6a9fd8', anchor=tk.W)
-        self._status_label.pack(fill="x", padx=6, pady=(0, 2))
-
         # ---- Log ----
         log_frame = ttk.LabelFrame(main, text="Log", padding=4)
         log_frame.pack(fill="both", expand=True, **pad)
@@ -295,6 +307,11 @@ class App(tk.Tk):
         root_log = logging.getLogger("tenbitredo")
         root_log.addHandler(handler)
         root_log.setLevel(logging.INFO)
+        self._log_text.tag_configure("copy",   foreground="#4ec9b0")
+        self._log_text.tag_configure("encode", foreground="#ce9178")
+        self._log_text.tag_configure("warn",   foreground="#dcdcaa")
+        self._log_text.tag_configure("err",    foreground="#f14c4c")
+        self._log_text.tag_configure("normal", foreground=_FG)
 
     # -- ffmpeg init -------------------------------------------------------
 
@@ -507,10 +524,12 @@ class App(tk.Tk):
                 return
 
         self._working = True
-        self._save_btn.configure(state="disabled")
+        self._progress_target = 0.0
+        self._cancel_event = threading.Event()
+        self._ff.set_cancel_event(self._cancel_event)
+        self._save_btn.configure(text="\u25a0  Cancel", command=self._do_cancel, style="TButton")
         self._progress_var.set(0)
         self._pct_var.set("0%")
-        self._status_label.configure(text="")
 
         t = threading.Thread(target=self._save_worker,
                              args=(source, segments, output), daemon=True)
@@ -518,38 +537,68 @@ class App(tk.Tk):
 
     def _save_worker(self, source: str, segments: list, output: str):
         try:
-            engine = SmartSave10Bit(self._ff,
-                                     crf=self._crf_var.get(),
-                                     preset=self._preset_var.get())
-            engine.set_progress_callback(self._on_progress)
-            engine.set_status_callback(self._on_status)
-            engine.save(source, segments, output)
+            self._engine = SmartSave10Bit(self._ff,
+                                           crf=self._crf_var.get(),
+                                           preset=self._preset_var.get())
+            self._engine.set_progress_callback(self._on_progress)
+            self._engine.save(source, segments, output)
             self.after(0, lambda: messagebox.showinfo("Complete",
                 f"10-bit HEVC output saved:\n{output}"))
+        except RuntimeError as e:
+            if str(e) == "Cancelled":
+                log.info("Save cancelled by user.")
+            else:
+                log.error("Save failed: %s", e)
+                self.after(0, lambda msg=str(e): messagebox.showerror("Error",
+                    f"Save failed:\n{msg}"))
         except Exception as e:
             log.error("Save failed: %s", e)
-            self.after(0, lambda: messagebox.showerror("Error",
-                f"Save failed:\n{e}"))
+            self.after(0, lambda msg=str(e): messagebox.showerror("Error",
+                f"Save failed:\n{msg}"))
         finally:
+            self._engine = None
             self.after(0, self._save_done)
 
     def _on_progress(self, pct: float, msg: str):
-        self.after(0, self._update_progress, pct, msg)
+        self.after(0, self._animate_to, pct)
 
-    def _on_status(self, status_line: str):
-        self.after(0, self._update_status, status_line)
+    def _animate_to(self, target: float):
+        self._progress_target = target
+        if not self._animating:
+            self._animating = True
+            self._do_animate()
 
-    def _update_progress(self, pct: float, msg: str):
-        self._progress_var.set(pct)
-        self._pct_var.set(f"{pct:.0f}%")
+    def _do_animate(self):
+        current = self._progress_var.get()
+        target = self._progress_target
+        if current < target - 0.1:
+            step = max(0.5, (target - current) * 0.15)
+            new = min(current + step, target)
+            self._progress_var.set(new)
+            self._pct_var.set(f"{new:.0f}%")
+            self.after(30, self._do_animate)
+        else:
+            self._progress_var.set(target)
+            self._pct_var.set(f"{target:.0f}%")
+            self._animating = False
 
-    def _update_status(self, status_line: str):
-        self._status_label.configure(text=status_line)
+    def _do_cancel(self):
+        if self._engine:
+            self._engine.cancel()
+        self._save_btn.configure(state="disabled")
+        log.info("Cancelling...")
 
     def _save_done(self):
         self._working = False
-        self._save_btn.configure(state="normal")
-        self._status_label.configure(text="")
+        self._animating = False
+        if self._cancel_event:
+            self._ff.set_cancel_event(None)
+            self._cancel_event = None
+        self._save_btn.configure(
+            text="\u25b6  Save 10-bit HEVC", command=self._do_save,
+            style="Accent.TButton", state="normal")
+        self._progress_var.set(0)
+        self._pct_var.set("")
 
 
 # ---------------------------------------------------------------------------

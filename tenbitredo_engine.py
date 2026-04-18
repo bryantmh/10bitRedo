@@ -91,6 +91,11 @@ class FFmpegHelper:
             raise FileNotFoundError("ffmpeg not found.")
         if not self.ffprobe:
             raise FileNotFoundError("ffprobe not found.")
+        self._cancel_event = None
+
+    def set_cancel_event(self, ev):
+        """Set a threading.Event; when set, the running ffmpeg process is killed."""
+        self._cancel_event = ev
 
     @staticmethod
     def _find(name):
@@ -195,64 +200,35 @@ class FFmpegHelper:
         log.info("Found %d keyframes near %d boundary points", len(result), len(times))
         return result
 
-    def run(self, args, timeout=7200, progress_cb=None, status_cb=None):
-        """Run an ffmpeg command.
-
-        If *status_cb* is provided, ffmpeg is launched with ``-progress pipe:1``
-        and *status_cb(line_str)* is called with formatted stats (frame, fps,
-        time, speed) as they arrive.
-        """
-        if status_cb:
-            # Insert -progress pipe:1 -nostats right after any -hide_banner / -y / -loglevel
-            args = list(args)
-            insert_idx = 0
-            for i, a in enumerate(args):
-                if a in ("-hide_banner", "-y", "-loglevel", "warning", "error", "info"):
-                    insert_idx = i + 1
-                else:
-                    break
-            args[insert_idx:insert_idx] = ["-progress", "pipe:1", "-nostats"]
+    def run(self, args, timeout=7200):
+        """Run an ffmpeg command. Raises RuntimeError on failure or cancellation."""
         cmd = [self.ffmpeg] + args
         log.debug("CMD: %s", " ".join(cmd))
-        if status_cb or progress_cb:
+        if self._cancel_event:
             import threading as _th
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                     text=True, encoding="utf-8", errors="replace",
                                     creationflags=_SUBPROCESS_FLAGS)
             stderr_lines = []
-            def _drain_stderr():
+            def _drain():
                 for line in proc.stderr:
                     stderr_lines.append(line)
-            t = _th.Thread(target=_drain_stderr, daemon=True)
+            t = _th.Thread(target=_drain, daemon=True)
             t.start()
-            if status_cb:
-                _prog = {}
-                for line in proc.stdout:
-                    line = line.strip()
-                    if "=" in line:
-                        k, _, v = line.partition("=")
-                        _prog[k] = v
-                    if line.startswith("progress="):
-                        parts = []
-                        for key in ("frame", "fps", "out_time", "speed"):
-                            val = _prog.get(key, "")
-                            if val and val not in ("N/A", "0.00", "0.00x", ""):
-                                label = "time" if key == "out_time" else key
-                                if key == "out_time":
-                                    val = val[:8]
-                                parts.append(f"{label}={val}")
-                        if parts:
-                            status_cb("  ".join(parts))
-                        _prog = {}
-            elif progress_cb:
-                for line in proc.stderr:
-                    line = line.strip()
-                    if line.startswith("frame=") or "time=" in line:
-                        progress_cb(line)
+            ev = self._cancel_event
+            def _watch():
+                while True:
+                    if ev.wait(timeout=0.1):
+                        proc.kill()
+                        break
+                    if proc.poll() is not None:
+                        break
+            _th.Thread(target=_watch, daemon=True).start()
+            proc.stdout.read()  # drain (nothing expected with -loglevel warning)
             proc.wait()
             t.join(timeout=5)
-            if status_cb:
-                status_cb("")  # clear status on completion
+            if ev.is_set():
+                raise RuntimeError("Cancelled")
             if proc.returncode != 0:
                 full_err = "".join(stderr_lines)
                 raise RuntimeError(f"ffmpeg failed (rc={proc.returncode})\n{full_err[-2000:]}")
@@ -489,15 +465,21 @@ class SmartSave10Bit:
         self.crf = crf
         self.preset = preset
         self._cb = None
-        self._status_cb = None
         self._temp_dir = None
+        self._total_steps = 1
+        self._global_step = 0
 
     def set_progress_callback(self, cb):
         self._cb = cb
 
-    def set_status_callback(self, cb):
-        """Set a callback for live ffmpeg stats: cb(status_line_str)."""
-        self._status_cb = cb
+    def cancel(self):
+        """Request cancellation of the running save operation."""
+        if self.ff._cancel_event:
+            self.ff._cancel_event.set()
+
+    def _check_cancel(self):
+        if self.ff._cancel_event and self.ff._cancel_event.is_set():
+            raise RuntimeError("Cancelled")
 
     def _report(self, pct, msg):
         if self._cb:
@@ -536,31 +518,35 @@ class SmartSave10Bit:
         self._keyframes = keyframes
         if not keyframes:
             log.warning("No keyframes found near boundaries; will re-encode all segments")
+        self._check_cancel()
 
         self._report(8, "Planning smart edit...")
         plans = self._plan_all(segments, keyframes)
         self._log_plans(plans)
+        self._total_steps = max(1, sum(
+            sum(1 for k in ("head", "body", "tail") if p[k] is not None)
+            for p in plans
+        ))
+        self._global_step = 0
 
         all_parts = []
-        n = len(plans)
         for i, plan in enumerate(plans):
-            base_pct = 10 + 80 * i / n
-            span_pct = 80 / n
-            parts = self._process_one(input_file, info, plan, i, base_pct, span_pct)
+            self._check_cancel()
+            parts = self._process_one(input_file, info, plan, i)
             all_parts.extend(parts)
 
         if not all_parts:
             raise RuntimeError("No output segments were produced.")
 
+        self._check_cancel()
+        chapters_file = self._build_chapters_file(input_file, segments)
+
         self._report(92, "Concatenating into final output...")
         self._concat([p for p, _, _ in all_parts], output_file,
                      durations=[d for _, d, _ in all_parts],
                      inpoints=[ip for _, _, ip in all_parts],
-                     source_file=input_file)
-
-        # Remap and apply chapters from source
-        self._report(96, "Applying remapped chapters...")
-        self._apply_chapters(input_file, segments, output_file)
+                     source_file=input_file,
+                     chapters_file=chapters_file)
 
         size_mb = os.path.getsize(output_file) / (1024 * 1024)
         self._report(100, f"Done! {output_file} ({size_mb:.1f} MB)")
@@ -617,7 +603,7 @@ class SmartSave10Bit:
                 parts.append(f"tail({fmt_time(p['tail'][0])}-{fmt_time(p['tail'][1])} re-enc)")
             log.info("Seg %d [%s-%s]: %s", i, fmt_time(seg.start), fmt_time(seg.end), " | ".join(parts))
 
-    def _process_one(self, input_file, info, plan, idx, base_pct, pct_span):
+    def _process_one(self, input_file, info, plan, idx):
         parts = []
         steps = [("head", plan["head"]), ("body", plan["body"]), ("tail", plan["tail"])]
         active = [(n, r) for n, r in steps if r is not None]
@@ -625,7 +611,8 @@ class SmartSave10Bit:
             return parts
         frame_dur = 1.0 / (info.fps or 24.0)
         for j, (name, (start, end)) in enumerate(active):
-            pct = base_pct + pct_span * j / len(active)
+            pct = 10 + 80 * self._global_step / self._total_steps
+            self._global_step += 1
             out = os.path.join(self._temp_dir, f"seg{idx}_{name}.mkv")
             if name == "body":
                 self._report(pct, f"Seg {idx+1}: stream-copying {fmt_time(start)} - {fmt_time(end)}")
@@ -848,7 +835,7 @@ class SmartSave10Bit:
         args.extend(["-c:a", "copy",
                      "-map_metadata", "0", "-map_chapters", "-1",
                      "-f", "matroska", dst])
-        self.ff.run(args, status_cb=self._status_cb)
+        self.ff.run(args)
 
     def _x265_params(self, info):
         params = ["repeat-headers=1", "aq-mode=3"]
@@ -866,8 +853,45 @@ class SmartSave10Bit:
             params.append(f"max-cll={info.content_light}")
         return ":".join(params)
 
+    def _build_chapters_file(self, source_file, segments):
+        """Probe source chapters, remap to output timeline, write an ffmetadata
+        file.  Returns the file path, or None if the source has no chapters."""
+        cmd = [self.ff.ffprobe, "-v", "quiet", "-print_format", "json",
+               "-show_chapters", source_file]
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=60, creationflags=_SUBPROCESS_FLAGS)
+        try:
+            chapters = json.loads(r.stdout).get("chapters", [])
+        except (json.JSONDecodeError, KeyError):
+            chapters = []
+        if not chapters:
+            log.info("No chapters in source — skipping chapter mapping.")
+            return None
+
+        remapped = self._remap_chapters(chapters, segments)
+        if not remapped:
+            log.info("No chapters overlap with kept segments.")
+            return None
+
+        log.info("Remapping %d/%d chapters to output timeline.", len(remapped), len(chapters))
+        meta_file = os.path.join(self._temp_dir, "chapters.txt")
+        with open(meta_file, "w", encoding="utf-8") as f:
+            f.write(";FFMETADATA1\n")
+            for ch in remapped:
+                f.write("\n[CHAPTER]\n")
+                f.write("TIMEBASE=1/1000\n")
+                f.write(f"START={int(ch['start'] * 1000)}\n")
+                f.write(f"END={int(ch['end'] * 1000)}\n")
+                title = ch.get("title", "")
+                if title:
+                    title = title.replace("\\", "\\\\").replace("=", "\\=")
+                    title = title.replace(";", "\\;").replace("#", "\\#")
+                    title = title.replace("\n", "")
+                    f.write(f"title={title}\n")
+        return meta_file
+
     def _concat(self, parts, output_file, durations=None, inpoints=None,
-                source_file=None):
+                source_file=None, chapters_file=None):
         list_file = os.path.join(self._temp_dir, "concat.txt")
         with open(list_file, "w", encoding="utf-8") as f:
             for i, p in enumerate(parts):
@@ -882,12 +906,21 @@ class SmartSave10Bit:
         ext = os.path.splitext(output_file)[1].lower()
         args = ["-hide_banner", "-y", "-loglevel", "warning",
                 "-f", "concat", "-safe", "0", "-i", list_file]
-        # Add original source as second input for metadata/chapters
+        next_idx = 1
+        meta_idx = None
+        chap_idx = None
         if source_file:
             args.extend(["-i", source_file])
+            meta_idx = next_idx
+            next_idx += 1
+        if chapters_file:
+            args.extend(["-f", "ffmetadata", "-i", chapters_file])
+            chap_idx = next_idx
+            next_idx += 1
         args.extend(["-c", "copy", "-map", "0"])
-        if source_file:
-            args.extend(["-map_metadata", "1", "-map_chapters", "-1"])
+        if meta_idx is not None:
+            args.extend(["-map_metadata", str(meta_idx)])
+        args.extend(["-map_chapters", str(chap_idx) if chap_idx is not None else "-1"])
         if ext == ".mkv":
             args.extend(["-f", "matroska"])
         elif ext == ".mp4":
@@ -896,65 +929,6 @@ class SmartSave10Bit:
             args.extend(["-f", "mpegts"])
         args.append(output_file)
         self.ff.run(args)
-
-    def _apply_chapters(self, source_file, segments, output_file):
-        """Extract chapters from source, remap timestamps to account for
-        removed segments, and embed them in the output file."""
-        cmd = [self.ff.ffprobe, "-v", "quiet", "-print_format", "json",
-               "-show_chapters", source_file]
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=60, creationflags=_SUBPROCESS_FLAGS)
-        try:
-            chapters = json.loads(r.stdout).get("chapters", [])
-        except (json.JSONDecodeError, KeyError):
-            chapters = []
-        if not chapters:
-            log.info("No chapters in source — skipping chapter mapping.")
-            return
-
-        remapped = self._remap_chapters(chapters, segments)
-        if not remapped:
-            log.info("No chapters overlap with kept segments.")
-            return
-
-        log.info("Remapping %d/%d chapters to output timeline.", len(remapped), len(chapters))
-        meta_file = os.path.join(self._temp_dir, "chapters.txt")
-        with open(meta_file, "w", encoding="utf-8") as f:
-            f.write(";FFMETADATA1\n")
-            for ch in remapped:
-                f.write("\n[CHAPTER]\n")
-                f.write("TIMEBASE=1/1000\n")
-                f.write(f"START={int(ch['start'] * 1000)}\n")
-                f.write(f"END={int(ch['end'] * 1000)}\n")
-                title = ch.get("title", "")
-                if title:
-                    # Escape special ffmetadata characters
-                    title = title.replace("\\", "\\\\").replace("=", "\\=")
-                    title = title.replace(";", "\\;").replace("#", "\\#")
-                    title = title.replace("\n", "")
-                    f.write(f"title={title}\n")
-
-        tmp = output_file + ".chapters.mkv"
-        ext = os.path.splitext(output_file)[1].lower()
-        args = ["-hide_banner", "-y", "-loglevel", "warning",
-                "-i", output_file,
-                "-f", "ffmetadata", "-i", meta_file,
-                "-map", "0", "-map_chapters", "1", "-map_metadata", "0",
-                "-c", "copy"]
-        if ext == ".mkv":
-            args.extend(["-f", "matroska"])
-        elif ext == ".mp4":
-            args.extend(["-f", "mp4", "-movflags", "+faststart"])
-        elif ext in (".ts", ".m2ts"):
-            args.extend(["-f", "mpegts"])
-        args.append(tmp)
-        try:
-            self.ff.run(args)
-            os.replace(tmp, output_file)
-        except Exception as e:
-            log.warning("Could not apply chapters: %s", e)
-            if os.path.isfile(tmp):
-                os.remove(tmp)
 
     @staticmethod
     def _remap_chapters(chapters, segments):
