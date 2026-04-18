@@ -200,12 +200,20 @@ class FFmpegHelper:
         log.info("Found %d keyframes near %d boundary points", len(result), len(times))
         return result
 
-    def run(self, args, timeout=7200):
-        """Run an ffmpeg command. Raises RuntimeError on failure or cancellation."""
-        cmd = [self.ffmpeg] + args
+    def run(self, args, timeout=7200, step_cb=None):
+        """Run an ffmpeg command. Raises RuntimeError on failure or cancellation.
+
+        If *step_cb* is provided, ``-progress pipe:1`` is inserted and
+        *step_cb(out_time_seconds)* is called as ffmpeg emits progress data.
+        Works for both re-encode and stream-copy commands.
+        """
+        import threading as _th
+        cmd_args = list(args)
+        if step_cb:
+            cmd_args = ["-progress", "pipe:1"] + cmd_args
+        cmd = [self.ffmpeg] + cmd_args
         log.debug("CMD: %s", " ".join(cmd))
-        if self._cancel_event:
-            import threading as _th
+        if self._cancel_event is not None or step_cb is not None:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                     text=True, encoding="utf-8", errors="replace",
                                     creationflags=_SUBPROCESS_FLAGS)
@@ -215,19 +223,36 @@ class FFmpegHelper:
                     stderr_lines.append(line)
             t = _th.Thread(target=_drain, daemon=True)
             t.start()
-            ev = self._cancel_event
-            def _watch():
-                while True:
-                    if ev.wait(timeout=0.1):
-                        proc.kill()
-                        break
-                    if proc.poll() is not None:
-                        break
-            _th.Thread(target=_watch, daemon=True).start()
-            proc.stdout.read()  # drain (nothing expected with -loglevel warning)
+            if self._cancel_event:
+                ev = self._cancel_event
+                def _watch():
+                    while True:
+                        if ev.wait(timeout=0.1):
+                            proc.kill()
+                            break
+                        if proc.poll() is not None:
+                            break
+                _th.Thread(target=_watch, daemon=True).start()
+            if step_cb:
+                _prog = {}
+                for raw in proc.stdout:
+                    line = raw.strip()
+                    if "=" in line:
+                        k, _, v = line.partition("=")
+                        _prog[k] = v
+                    if line.startswith("progress="):
+                        try:
+                            ot_us = int(_prog.get("out_time_us", 0))
+                            if ot_us > 0:
+                                step_cb(ot_us / 1_000_000)
+                        except (ValueError, TypeError):
+                            pass
+                        _prog = {}
+            else:
+                proc.stdout.read()
             proc.wait()
             t.join(timeout=5)
-            if ev.is_set():
+            if self._cancel_event and self._cancel_event.is_set():
                 raise RuntimeError("Cancelled")
             if proc.returncode != 0:
                 full_err = "".join(stderr_lines)
@@ -466,8 +491,11 @@ class SmartSave10Bit:
         self.preset = preset
         self._cb = None
         self._temp_dir = None
-        self._total_steps = 1
-        self._global_step = 0
+        self._total_weight = 1.0
+        self._completed_weight = 0.0
+        self._step_base_pct = 10.0
+        self._step_pct_span = 0.0
+        self._step_expected_dur = 0.001
 
     def set_progress_callback(self, cb):
         self._cb = cb
@@ -485,6 +513,28 @@ class SmartSave10Bit:
         if self._cb:
             self._cb(pct, msg)
         log.info("[%.0f%%] %s", pct, msg)
+
+    def _on_step_progress(self, out_time):
+        """Called by ffmpeg progress pipe; fires _cb with interpolated overall pct."""
+        if not self._cb or self._step_expected_dur <= 0:
+            return
+        frac = min(out_time / self._step_expected_dur, 1.0)
+        self._cb(self._step_base_pct + frac * self._step_pct_span, "")
+
+    def _begin_step(self, expected_dur):
+        """Set up weight-based progress for the next ff.run call.
+        Returns the step_cb to pass to ff.run (None if no GUI callback)."""
+        w = max(expected_dur, 0.001)
+        self._step_base_pct = 10.0 + 90.0 * self._completed_weight / self._total_weight
+        self._step_pct_span = 90.0 * w / self._total_weight
+        self._step_expected_dur = w
+        return self._on_step_progress if self._cb else None
+
+    def _finish_step(self, duration):
+        """Advance completed weight and snap bar to step-end position."""
+        self._completed_weight += duration
+        if self._cb:
+            self._cb(10.0 + 90.0 * self._completed_weight / self._total_weight, "")
 
     def save(self, input_file, segments, output_file):
         self._temp_dir = tempfile.mkdtemp(prefix="vrd10bit_")
@@ -523,11 +573,17 @@ class SmartSave10Bit:
         self._report(8, "Planning smart edit...")
         plans = self._plan_all(segments, keyframes)
         self._log_plans(plans)
-        self._total_steps = max(1, sum(
-            sum(1 for k in ("head", "body", "tail") if p[k] is not None)
-            for p in plans
-        ))
-        self._global_step = 0
+
+        # Weight each sub-step by its duration; concat weighted = total output duration
+        step_dur_list = []
+        for plan in plans:
+            for name in ("head", "body", "tail"):
+                if plan[name]:
+                    s, e = plan[name]
+                    step_dur_list.append(e - s)
+        total_seg_dur = sum(seg.duration for seg in segments)
+        self._total_weight = max(sum(step_dur_list) + total_seg_dur, 0.001)
+        self._completed_weight = 0.0
 
         all_parts = []
         for i, plan in enumerate(plans):
@@ -541,12 +597,15 @@ class SmartSave10Bit:
         self._check_cancel()
         chapters_file = self._build_chapters_file(input_file, segments)
 
-        self._report(92, "Concatenating into final output...")
+        concat_step_cb = self._begin_step(total_seg_dur)
+        self._report(self._step_base_pct, "Concatenating into final output...")
         self._concat([p for p, _, _ in all_parts], output_file,
                      durations=[d for _, d, _ in all_parts],
                      inpoints=[ip for _, _, ip in all_parts],
                      source_file=input_file,
-                     chapters_file=chapters_file)
+                     chapters_file=chapters_file,
+                     step_cb=concat_step_cb)
+        self._finish_step(total_seg_dur)
 
         size_mb = os.path.getsize(output_file) / (1024 * 1024)
         self._report(100, f"Done! {output_file} ({size_mb:.1f} MB)")
@@ -611,12 +670,13 @@ class SmartSave10Bit:
             return parts
         frame_dur = 1.0 / (info.fps or 24.0)
         for j, (name, (start, end)) in enumerate(active):
-            pct = 10 + 80 * self._global_step / self._total_steps
-            self._global_step += 1
+            step_dur = end - start
+            step_cb = self._begin_step(step_dur)
+            pct = self._step_base_pct
             out = os.path.join(self._temp_dir, f"seg{idx}_{name}.mkv")
             if name == "body":
                 self._report(pct, f"Seg {idx+1}: stream-copying {fmt_time(start)} - {fmt_time(end)}")
-                self._stream_copy(input_file, start, end, out, info)
+                self._stream_copy(input_file, start, end, out, info, step_cb=step_cb)
             else:
                 reencode_end = end
                 if name == "head" and plan["body"] is not None:
@@ -626,7 +686,8 @@ class SmartSave10Bit:
                     # boundary due to float-precision timestamp matching.
                     reencode_end = end - frame_dur / 2
                 self._report(pct, f"Seg {idx+1}: re-encoding {name} {fmt_time(start)} - {fmt_time(end)} (10-bit HEVC)")
-                self._reencode(input_file, start, reencode_end, out, info)
+                self._reencode(input_file, start, reencode_end, out, info, step_cb=step_cb)
+            self._finish_step(step_dur)
             if os.path.isfile(out) and os.path.getsize(out) > 0:
                 first_pts, last_pts = self._get_pts_range(out)
                 if first_pts is None:
@@ -659,7 +720,7 @@ class SmartSave10Bit:
             return None, None
         return min(pts_values), max(pts_values)
 
-    def _stream_copy(self, src, start, end, dst, info):
+    def _stream_copy(self, src, start, end, dst, info, step_cb=None):
         # Stream-copy with a generous duration, then trim precisely.
         # With B-frame reorder, -c copy -t cannot exclude the boundary
         # keyframe reliably (its DTS precedes its PTS).  We include extra
@@ -684,7 +745,7 @@ class SmartSave10Bit:
                 seek_target = kfs[idx]
                 compensated = True
 
-        self._run_copy_extract(src, seek_target, duration, dst, info)
+        self._run_copy_extract(src, seek_target, duration, dst, info, step_cb=step_cb)
 
         # Verify: intermediate's first KF packet size must match source KF at start
         if compensated:
@@ -694,12 +755,12 @@ class SmartSave10Bit:
                 log.info("Seek compensation wrong (pkt %d vs %d); "
                          "retrying direct seek to %.3f",
                          int_sz, src_sz, start)
-                self._run_copy_extract(src, start, duration, dst, info)
+                self._run_copy_extract(src, start, duration, dst, info, step_cb=step_cb)
 
         # Trim to exactly the wanted frames (PTS < boundary in the intermediate)
         self._trim_body(dst, start, end, info)
 
-    def _run_copy_extract(self, src, seek, duration, dst, info):
+    def _run_copy_extract(self, src, seek, duration, dst, info, step_cb=None):
         """Run a single stream-copy extraction with -ss seek."""
         args = ["-hide_banner", "-y", "-loglevel", "warning",
                 "-ss", f"{seek:.6f}", "-i", src,
@@ -711,7 +772,7 @@ class SmartSave10Bit:
                      "-map_metadata", "0", "-map_chapters", "-1",
                      "-avoid_negative_ts", "make_zero",
                      "-f", "matroska", dst])
-        self.ff.run(args)
+        self.ff.run(args, step_cb=step_cb)
 
     def _probe_kf_packet_size(self, path, near_pts):
         """Return packet size of the keyframe closest to *near_pts*."""
@@ -813,7 +874,7 @@ class SmartSave10Bit:
         self.ff.run(args)
         os.replace(tmp, path)
 
-    def _reencode(self, src, start, end, dst, info):
+    def _reencode(self, src, start, end, dst, info, step_cb=None):
         duration = end - start
         # Single -ss before -i is frame-accurate when transcoding (ffmpeg ≥2.1,
         # -accurate_seek on by default).  It seeks to the keyframe before
@@ -835,7 +896,7 @@ class SmartSave10Bit:
         args.extend(["-c:a", "copy",
                      "-map_metadata", "0", "-map_chapters", "-1",
                      "-f", "matroska", dst])
-        self.ff.run(args)
+        self.ff.run(args, step_cb=step_cb)
 
     def _x265_params(self, info):
         params = ["repeat-headers=1", "aq-mode=3"]
@@ -891,7 +952,7 @@ class SmartSave10Bit:
         return meta_file
 
     def _concat(self, parts, output_file, durations=None, inpoints=None,
-                source_file=None, chapters_file=None):
+                source_file=None, chapters_file=None, step_cb=None):
         list_file = os.path.join(self._temp_dir, "concat.txt")
         with open(list_file, "w", encoding="utf-8") as f:
             for i, p in enumerate(parts):
@@ -928,7 +989,7 @@ class SmartSave10Bit:
         elif ext in (".ts", ".m2ts"):
             args.extend(["-f", "mpegts"])
         args.append(output_file)
-        self.ff.run(args)
+        self.ff.run(args, step_cb=step_cb)
 
     @staticmethod
     def _remap_chapters(chapters, segments):

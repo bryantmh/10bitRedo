@@ -157,6 +157,14 @@ class App(tk.Tk):
             background=[('active', '#1177bb'), ('pressed', '#094771'),
                         ('disabled', '#3a3a3a')],
             foreground=[('disabled', '#777777')])
+        # Cancel style — red background
+        style.configure('Cancel.TButton',
+            background='#8b1a1a', foreground='#ffffff',
+            bordercolor='#aa2222', relief='flat', padding=4)
+        style.map('Cancel.TButton',
+            background=[('active', '#aa2222'), ('pressed', '#6b0000'),
+                        ('disabled', '#3a3a3a')],
+            foreground=[('disabled', '#777777')])
 
     def _apply_dark_titlebar(self):
         try:
@@ -527,7 +535,7 @@ class App(tk.Tk):
         self._progress_target = 0.0
         self._cancel_event = threading.Event()
         self._ff.set_cancel_event(self._cancel_event)
-        self._save_btn.configure(text="\u25a0  Cancel", command=self._do_cancel, style="TButton")
+        self._save_btn.configure(text="\u25a0  Cancel", command=self._do_cancel, style="Cancel.TButton")
         self._progress_var.set(0)
         self._pct_var.set("0%")
 
