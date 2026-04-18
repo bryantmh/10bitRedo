@@ -53,10 +53,6 @@ For each kept segment:
 - **HEAD / TAIL**: partial GOPs at edit boundaries are re-encoded using ffmpeg's `libx265` with `main10` profile and `yuv420p10le` pixel format
 - **Chapters**: source chapter markers that overlap with kept segments are remapped to correct output timestamps
 
-### HEVC Seek Compensation
-
-ffmpeg's `-ss` (before `-i`) with `-c copy` on HEVC Dolby Vision MKV content consistently lands 1 GOP before the target keyframe. 10bitRedo detects this by comparing the first keyframe's packet size in the extracted intermediate against the expected source keyframe. If the sizes don't match, it compensates by seeking to the next keyframe and verifying — with an automatic fallback to direct seek if compensation is wrong.
-
 ## Files
 
 | File | Description |
