@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<VideoReDoProject>
+  <Filename>c:\Users\Bryant\Documents\Code\VideoReDoTVSuite6\Unofficial\tests\test_source.mkv</Filename>
+  <Duration>321140000</Duration>
+  <CutMode>1</CutMode>
+  <CutList>
+    <NumberOfCuts>2</NumberOfCuts>
+    <cut>
+      <CutTimeStart>20000000</CutTimeStart>
+      <CutTimeEnd>100000000</CutTimeEnd>
+    </cut>
+    <cut>
+      <CutTimeStart>220000000</CutTimeStart>
+      <CutTimeEnd>280000000</CutTimeEnd>
+    </cut>
+  </CutList>
+</VideoReDoProject>
