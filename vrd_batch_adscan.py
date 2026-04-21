@@ -41,6 +41,8 @@ VIDEO_EXTS = {
     '.mpg', '.mpeg', '.flv', '.vob', '.divx',
 }
 
+NO_ADS_SUFFIX = '_no_ads'
+
 # OUTPUT_STATE enum (from VideoReDo.tlb)
 OUTPUT_NONE     = 0
 OUTPUT_SAVING   = 1
@@ -76,11 +78,17 @@ def _fmt_bytes(n: int) -> str:
 
 
 def find_videos(root: str) -> list[str]:
+    """Recursively walk `root` for video files, skipping our own outputs."""
     paths = []
     for dirpath, _dirs, files in os.walk(root):
         for f in files:
-            if os.path.splitext(f)[1].lower() in VIDEO_EXTS:
-                paths.append(os.path.join(dirpath, f))
+            stem, ext = os.path.splitext(f)
+            if ext.lower() not in VIDEO_EXTS:
+                continue
+            if stem.endswith(NO_ADS_SUFFIX):
+                # Skip files this script already produced.
+                continue
+            paths.append(os.path.join(dirpath, f))
     return sorted(paths)
 
 
@@ -269,19 +277,15 @@ def process_file(vrd, path: str, recycle: bool,
 
     # -- Recycle original and rename output if --recycle ---------------------
     if recycle:
-        if not _HAS_SEND2TRASH:
-            _tprint(f'{label}WARNING: send2trash not installed; '
-                    '--recycle skipped.  Run: pip install send2trash')
-        else:
-            try:
-                send2trash(path)
-            except Exception as e:
-                _tprint(f'{label}WARNING: Could not recycle original: {e}')
-                return True, orig_size, new_size
-            try:
-                os.rename(temp_output, path)
-            except Exception as e:
-                _tprint(f'{label}WARNING: Recycle OK but rename failed: {e}')
+        try:
+            send2trash(path)
+        except Exception as e:
+            _tprint(f'{label}WARNING: Could not recycle original: {e}')
+            return True, orig_size, new_size
+        try:
+            os.rename(temp_output, path)
+        except Exception as e:
+            _tprint(f'{label}WARNING: Recycle OK but rename failed: {e}')
 
     return True, orig_size, new_size
 
@@ -393,6 +397,12 @@ def main():
         import pythoncom
     except ImportError:
         print('ERROR: pywin32 is not installed.  Run: pip install pywin32',
+              file=sys.stderr)
+        sys.exit(1)
+
+    if args.recycle and not _HAS_SEND2TRASH:
+        print('ERROR: --recycle requires the send2trash package.  '
+              'Run: pip install send2trash',
               file=sys.stderr)
         sys.exit(1)
 
