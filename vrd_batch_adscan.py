@@ -28,13 +28,24 @@ import os
 import sys
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait as _fut_wait, FIRST_COMPLETED
 
 try:
     from send2trash import send2trash
     _HAS_SEND2TRASH = True
 except ImportError:
     _HAS_SEND2TRASH = False
+
+try:
+    from rich.console import Console
+    from rich.live import Live
+    from rich.table import Table
+    from rich.text import Text
+    from rich.panel import Panel
+    from rich import box as rich_box
+except ImportError:
+    print('ERROR: rich is required.  Run: pip install rich', file=sys.stderr)
+    sys.exit(1)
 
 VIDEO_EXTS = {
     '.mp4', '.mkv', '.avi', '.mov', '.wmv', '.m4v', '.ts', '.m2ts',
@@ -49,20 +60,91 @@ OUTPUT_SAVING   = 1
 OUTPUT_SCANNING = 2
 OUTPUT_PAUSED   = 3
 
-SCAN_POLL_INTERVAL   = 5.0    # seconds between scan-complete polls
-SCAN_START_TIMEOUT   = 15.0   # seconds to wait for scan to start
-SCAN_TIMEOUT         = 3600   # 1 h max for a single scan
-SAVE_POLL_INTERVAL   = 2.0    # seconds between save-complete polls
-SAVE_TIMEOUT         = 14400  # 4 h max for a single file (scan+save)
-LOAD_TIMEOUT         = 60     # seconds to wait for a file to load
+SCAN_POLL_INTERVAL = 5.0    # seconds between scan-complete polls
+SCAN_TIMEOUT       = 3600   # 1 h max for a single scan
+SAVE_POLL_INTERVAL = 2.0    # seconds between save-complete polls
+SAVE_TIMEOUT       = 14400  # 4 h max for a single file (scan+save)
+LOAD_TIMEOUT       = 60     # seconds to wait for a file to load
 
-_print_lock = threading.Lock()
+_stop_event = threading.Event()
+
+# ---------------------------------------------------------------------------
+#  Live display
+# ---------------------------------------------------------------------------
+
+console = Console(highlight=False)
+
+_slots_lock = threading.Lock()
+_slots: dict = {}  # idx -> {idx, total, fname, phase, pct, cuts, start}
 
 
-def _tprint(*args, **kwargs):
-    """Thread-safe print."""
-    with _print_lock:
-        print(*args, **kwargs)
+def _set_slot(idx: int, **kw) -> None:
+    with _slots_lock:
+        _slots[idx] = {'start': time.monotonic(), 'idx': idx, **kw}
+
+
+def _upd_slot(idx: int, **kw) -> None:
+    with _slots_lock:
+        if idx in _slots:
+            _slots[idx].update(kw)
+
+
+def _del_slot(idx: int) -> None:
+    with _slots_lock:
+        _slots.pop(idx, None)
+
+
+_PHASE_STYLE = {
+    'Loading':  'cyan',
+    'Scanning': 'yellow',
+    'Saving':   'bright_cyan',
+    'No ads':   'dim',
+    'Error':    'bold red',
+}
+
+
+def _fmt_elapsed(secs: float) -> str:
+    m, s = divmod(int(secs), 60)
+    h, m = divmod(m, 60)
+    return f'{h}h{m:02d}m' if h else f'{m}:{s:02d}'
+
+
+def _build_table() -> Panel:
+    with _slots_lock:
+        rows = sorted(_slots.items())
+    table = Table(
+        show_header=True, header_style='bold dim',
+        box=rich_box.SIMPLE_HEAD, expand=True,
+        show_edge=False, padding=(0, 1),
+    )
+    table.add_column('#',        width=8,  no_wrap=True)
+    table.add_column('File',     ratio=1,  no_wrap=True, overflow='ellipsis')
+    table.add_column('Phase',    width=10, no_wrap=True)
+    table.add_column('Progress', width=9,  no_wrap=True, justify='right')
+    table.add_column('Elapsed',  width=8,  no_wrap=True, justify='right')
+    for _, s in rows:
+        phase   = s.get('phase', '')
+        pct     = s.get('pct')
+        elapsed = time.monotonic() - s.get('start', time.monotonic())
+        table.add_row(
+            f"[dim]{s.get('idx','?')}/{s.get('total','?')}[/dim]",
+            Text(s.get('fname', ''), overflow='ellipsis'),
+            Text(phase, style=_PHASE_STYLE.get(phase, '')),
+            f'{pct:.0f}%' if pct is not None else '[dim]──[/dim]',
+            _fmt_elapsed(elapsed),
+        )
+    n = len(rows)
+    return Panel(
+        table,
+        title=f'[bold]VideoReDo Batch[/bold]  [dim]{n} active[/dim]',
+        border_style='bright_blue',
+        padding=(0, 1),
+    )
+
+
+def _log(*args, **kwargs) -> None:
+    """Print a permanent log line (appears above the live panel)."""
+    console.print(*args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +179,8 @@ def _wait_for(check_fn, timeout: float, interval: float,
     """Poll check_fn() until True or timeout. Returns True on success."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if _stop_event.is_set():
+            return False
         try:
             if check_fn():
                 return True
@@ -126,14 +210,14 @@ def _find_adscan_profile(vrd) -> str:
                        'Open VRD and create one under Tools > Output Profiles.')
 
 
-def _open_and_wait(vrd, path: str, label: str) -> bool:
+def _open_and_wait(vrd, path: str, status_fn) -> bool:
     """FileOpen + wait for NavigationGetState != 0. Returns True on success."""
     if not bool(vrd.FileOpen(path, False)):
-        _tprint(f'{label}ERROR: FileOpen({path!r}) returned False')
+        status_fn(phase='Error')
         return False
     if not _wait_for(lambda: int(vrd.NavigationGetState) != 0,
                      LOAD_TIMEOUT, 0.5):
-        _tprint(f'{label}ERROR: Timed out waiting for file to load')
+        status_fn(phase='Error')
         vrd.FileClose()
         return False
     return True
@@ -141,7 +225,7 @@ def _open_and_wait(vrd, path: str, label: str) -> bool:
 
 def process_file(vrd, path: str, recycle: bool,
                  adscan_profile: str,
-                 label: str = '') -> tuple[bool, int, int]:
+                 status_fn) -> tuple:
     """
     Run ad-scan + VRD native save on one file.
 
@@ -163,43 +247,39 @@ def process_file(vrd, path: str, recycle: bool,
     the GUI uses and flushes on save, so every detected commercial block
     makes it into the final cut list.
 
-    Returns (success, original_bytes, output_bytes).
-    success is False if no ads were detected or on error.
+    Returns (success, orig_bytes, new_bytes, n_cuts, err_msg).
+      success=True               -> err_msg is None
+      success=False, err_msg=''  -> no ads detected (skip, not an error)
+      success=False, err_msg='…' -> an error occurred
     """
     stem, ext = os.path.splitext(path)
     temp_output = stem + '_no_ads' + ext
     temp_vprj   = stem + '_no_ads.Vprj'
-    orig_size = os.path.getsize(path)
-
+    orig_size   = os.path.getsize(path)
     native_path = os.path.normpath(path)
 
     # -- Phase 1: ad-scan + save project -------------------------------------
-    if not _open_and_wait(vrd, native_path, label):
-        return False, orig_size, 0
+    status_fn(phase='Loading')
+    if not _open_and_wait(vrd, native_path, status_fn):
+        return False, 0, 0, 0, 'FileOpen failed'
 
     vrd.EditSetMode(0)   # Cut mode: regions in edits list are REMOVED on save.
 
     if os.path.exists(temp_vprj):
         os.remove(temp_vprj)
 
-    _tprint(f'{label}Scanning -> {os.path.basename(temp_vprj)}  '
-            f'(profile: {adscan_profile!r})')
+    status_fn(phase='Scanning', pct=0.0)
     if not bool(vrd.FileSaveAs(temp_vprj, adscan_profile)):
-        _tprint(f'{label}ERROR: FileSaveAs(.Vprj) returned False')
+        status_fn(phase='Error')
         vrd.FileClose()
-        return False, orig_size, 0
-
-    elapsed = [0.0]
+        return False, 0, 0, 0, f'FileSaveAs(.Vprj) failed — profile: {adscan_profile!r}'
 
     def _scan_tick():
-        elapsed[0] += SCAN_POLL_INTERVAL
         try:
-            cursor_ms = int(vrd.NavigationGetCursorTime)
-            dur_ms    = int(vrd.FileGetOpenedFileDuration)
-            pct = cursor_ms * 100.0 / dur_ms if dur_ms else 0.0
+            pct = float(vrd.OutputGetPercentComplete)
         except Exception:
             pct = 0.0
-        _tprint(f'{label}  scanning  {elapsed[0]:.0f}s  {pct:.1f}%')
+        status_fn(phase='Scanning', pct=pct)
 
     scan_done = _wait_for(
         lambda: (int(vrd.OutputGetState) == OUTPUT_NONE
@@ -211,51 +291,44 @@ def process_file(vrd, path: str, recycle: bool,
     vrd.FileClose()
 
     if not scan_done:
-        _tprint(f'{label}ERROR: Ad scan timed out')
-        return False, orig_size, 0
+        status_fn(phase='Error')
+        return False, 0, 0, 0, 'Ad scan timed out'
 
     if not os.path.isfile(temp_vprj):
-        _tprint(f'{label}ERROR: Scan produced no project file')
-        return False, orig_size, 0
+        status_fn(phase='Error')
+        return False, 0, 0, 0, 'Scan produced no project file'
 
     # -- Phase 2: reopen project, save with cuts applied ---------------------
-    if not _open_and_wait(vrd, temp_vprj, label):
+    status_fn(phase='Loading')
+    if not _open_and_wait(vrd, temp_vprj, status_fn):
         _cleanup_vprj(temp_vprj)
-        return False, orig_size, 0
+        return False, 0, 0, 0, 'Failed to open project file'
 
     n_cuts = int(vrd.EditGetEditsListCount)
-    _tprint(f'{label}  scan complete: {n_cuts} ad cut(s) detected')
-    for ci in range(min(n_cuts, 10)):
-        s = int(vrd.EditGetEditStartTime(ci))
-        e = int(vrd.EditGetEditEndTime(ci))
-        _tprint(f'{label}    cut[{ci}]: {s/1000:.1f}s - {e/1000:.1f}s')
+    status_fn(phase='Scanning', pct=100.0, cuts=n_cuts)
 
     if n_cuts == 0:
-        _tprint(f'{label}No ads detected -- skipping.')
+        status_fn(phase='No ads')
         vrd.FileClose()
         _cleanup_vprj(temp_vprj)
-        return False, orig_size, 0
+        return False, orig_size, 0, 0, ''
 
     if os.path.exists(temp_output):
         os.remove(temp_output)
 
-    _tprint(f'{label}Saving -> {os.path.basename(temp_output)}')
+    status_fn(phase='Saving', pct=0.0, cuts=n_cuts)
     if not bool(vrd.FileSaveAs(temp_output, '')):
-        _tprint(f'{label}ERROR: FileSaveAs(output) returned False')
+        status_fn(phase='Error')
         vrd.FileClose()
         _cleanup_vprj(temp_vprj)
-        return False, orig_size, 0
-
-    elapsed = [0]
+        return False, 0, 0, n_cuts, 'FileSaveAs(output) returned False'
 
     def _save_tick():
-        elapsed[0] += SAVE_POLL_INTERVAL
         try:
-            pct    = float(vrd.OutputGetPercentComplete)
-            status = str(vrd.OutputGetStatusText or '')
+            pct = float(vrd.OutputGetPercentComplete)
         except Exception:
-            pct, status = 0.0, ''
-        _tprint(f'{label}  {elapsed[0]:.0f}s  {pct:.1f}%  {status}')
+            pct = 0.0
+        status_fn(phase='Saving', pct=pct, cuts=n_cuts)
 
     save_done = _wait_for(
         lambda: int(vrd.OutputGetState) == OUTPUT_NONE,
@@ -266,12 +339,12 @@ def process_file(vrd, path: str, recycle: bool,
     _cleanup_vprj(temp_vprj)
 
     if not save_done:
-        _tprint(f'{label}ERROR: Save timed out')
-        return False, orig_size, 0
+        status_fn(phase='Error')
+        return False, 0, 0, n_cuts, 'Save timed out'
 
     if not os.path.isfile(temp_output) or os.path.getsize(temp_output) == 0:
-        _tprint(f'{label}ERROR: output file is missing or empty')
-        return False, orig_size, 0
+        status_fn(phase='Error')
+        return False, 0, 0, n_cuts, 'Output file is missing or empty'
 
     new_size = os.path.getsize(temp_output)
 
@@ -280,14 +353,14 @@ def process_file(vrd, path: str, recycle: bool,
         try:
             send2trash(path)
         except Exception as e:
-            _tprint(f'{label}WARNING: Could not recycle original: {e}')
-            return True, orig_size, new_size
+            _log(f'[yellow]  WARNING: Could not recycle original: {e}[/yellow]')
+            return True, orig_size, new_size, n_cuts, None
         try:
             os.rename(temp_output, path)
         except Exception as e:
-            _tprint(f'{label}WARNING: Recycle OK but rename failed: {e}')
+            _log(f'[yellow]  WARNING: Recycle OK but rename failed: {e}[/yellow]')
 
-    return True, orig_size, new_size
+    return True, orig_size, new_size, n_cuts, None
 
 
 def _cleanup_vprj(vprj_path: str) -> None:
@@ -302,18 +375,20 @@ def _cleanup_vprj(vprj_path: str) -> None:
 #  Worker  (one VideoReDo process per thread)
 # ---------------------------------------------------------------------------
 
-def _worker(task: tuple) -> tuple[str, bool, int, int]:
+def _worker(task: tuple) -> tuple:
     """
     Process one file. Each call launches its own VideoReDo silent instance
     so workers can run in parallel.
     """
     idx, total, path, recycle, adscan_profile = task
-    fname   = os.path.basename(path)
-    size_mb = os.path.getsize(path) / (1024 * 1024)
-    label   = f'[{idx}/{total}] {fname}: '
+    fname = os.path.basename(path)
 
-    _tprint(f'[{idx}/{total}] {fname}  ({size_mb:.1f} MB)')
+    _set_slot(idx, total=total, fname=fname, phase='Loading')
 
+    def status_fn(**kw):
+        _upd_slot(idx, **kw)
+
+    t0 = time.monotonic()
     import pythoncom
     pythoncom.CoInitialize()
     vrd_silent = vrd = None
@@ -321,20 +396,42 @@ def _worker(task: tuple) -> tuple[str, bool, int, int]:
         import win32com.client
         vrd_silent = win32com.client.Dispatch('VideoReDo6.VideoReDoSilent')
         vrd = vrd_silent.VRDInterface
-        success, orig_b, new_b = process_file(
-            vrd, path, recycle, adscan_profile, label=label
+        success, orig_b, new_b, n_cuts, err_msg = process_file(
+            vrd, path, recycle, adscan_profile, status_fn=status_fn
         )
+        elapsed = _fmt_elapsed(time.monotonic() - t0)
+        cuts_str = (f'  [bright_white]{n_cuts} cut{"s" if n_cuts != 1 else ""}[/bright_white]'
+                    if n_cuts > 0 else '')
         if success:
-            saved_b = orig_b - new_b
-            pct     = saved_b / orig_b * 100 if orig_b else 0.0
-            _tprint(f'[{idx}/{total}] {fname}: '
-                    f'{_fmt_bytes(orig_b)} -> {_fmt_bytes(new_b)}'
-                    f'  (saved {_fmt_bytes(saved_b)}, {pct:.1f}%)')
+            saved_b  = orig_b - new_b
+            pct_save = saved_b / orig_b * 100 if orig_b else 0.0
+            _log(
+                f'[bright_green]✓[/bright_green] [dim]{idx}/{total}[/dim]'
+                f'  {fname}'
+                f'  [cyan]{_fmt_bytes(orig_b)}[/cyan] → [cyan]{_fmt_bytes(new_b)}[/cyan]'
+                f'  [green]saved {_fmt_bytes(saved_b)} ({pct_save:.0f}%)[/green]'
+                f'{cuts_str}'
+                f'  [dim]{elapsed}[/dim]'
+            )
+        elif err_msg == '':
+            _log(f'[dim]○ {idx}/{total}  {fname}  No ads detected  {elapsed}[/dim]')
+        else:
+            _log(
+                f'[bold red]✗[/bold red] [dim]{idx}/{total}[/dim]'
+                f'  {fname}  [red]{err_msg}[/red]'
+                f'{cuts_str}'
+                f'  [dim]{elapsed}[/dim]'
+            )
         return path, success, orig_b, new_b
     except Exception as exc:
-        _tprint(f'[{idx}/{total}] {fname}: ERROR — {exc}')
+        elapsed = _fmt_elapsed(time.monotonic() - t0)
+        _log(
+            f'[bold red]✗[/bold red] [dim]{idx}/{total}[/dim]'
+            f'  {fname}  [red]{exc}[/red]  [dim]{elapsed}[/dim]'
+        )
         return path, False, 0, 0
     finally:
+        _del_slot(idx)
         if vrd is not None:
             try:
                 vrd.ProgramExit()
@@ -352,7 +449,7 @@ def _worker(task: tuple) -> tuple[str, bool, int, int]:
 
 def list_profiles(vrd) -> None:
     n = int(vrd.ProfilesGetCount)
-    print(f'{n} profile(s) available:\n')
+    console.print(f'{n} profile(s) available:\n')
     for i in range(n):
         enabled = bool(vrd.ProfilesGetProfileIsEnabled(i))
         name    = str(vrd.ProfilesGetProfileName(i))
@@ -360,11 +457,11 @@ def list_profiles(vrd) -> None:
         adscan  = bool(vrd.ProfilesGetProfileIsAdScan(i))
         tags = []
         if not enabled:
-            tags.append('disabled')
+            tags.append('[dim]disabled[/dim]')
         if adscan:
-            tags.append('ad-scan')
+            tags.append('[bright_yellow]ad-scan[/bright_yellow]')
         tag_str = f'  [{", ".join(tags)}]' if tags else ''
-        print(f'  [{i:2d}] {name!r:<40} .{ext}{tag_str}')
+        console.print(f'  [{i:2d}] [cyan]{name!r:<40}[/cyan] .{ext}{tag_str}')
 
 
 # ---------------------------------------------------------------------------
@@ -396,19 +493,18 @@ def main():
         import win32com.client
         import pythoncom
     except ImportError:
-        print('ERROR: pywin32 is not installed.  Run: pip install pywin32',
-              file=sys.stderr)
+        console.print('ERROR: pywin32 is not installed.  Run: pip install pywin32',
+                      style='red')
         sys.exit(1)
 
     if args.recycle and not _HAS_SEND2TRASH:
-        print('ERROR: --recycle requires the send2trash package.  '
-              'Run: pip install send2trash',
-              file=sys.stderr)
+        console.print('ERROR: --recycle requires the send2trash package.  '
+                      'Run: pip install send2trash', style='red')
         sys.exit(1)
 
     # ---- --list-profiles mode ----------------------------------------------
     if args.list_profiles:
-        print('Launching VideoReDo...')
+        console.print('Launching VideoReDo...')
         pythoncom.CoInitialize()
         try:
             vrd_silent = win32com.client.Dispatch('VideoReDo6.VideoReDoSilent')
@@ -431,19 +527,19 @@ def main():
         sys.exit(1)
 
     if not os.path.isdir(args.directory):
-        print(f'ERROR: not a directory: {args.directory}', file=sys.stderr)
+        console.print(f'ERROR: not a directory: {args.directory!r}', style='red')
         sys.exit(1)
 
     videos = find_videos(args.directory)
     total  = len(videos)
     if total == 0:
-        print('No video files found.')
+        console.print('No video files found.')
         return
 
     # Resolve the ad-scan profile name once so every worker uses the same one.
     adscan_profile = args.adscan_profile
     if adscan_profile is None:
-        print('Discovering ad-scan profile...')
+        console.print('Discovering ad-scan profile...')
         pythoncom.CoInitialize()
         try:
             vrd_silent = win32com.client.Dispatch('VideoReDo6.VideoReDoSilent')
@@ -454,19 +550,20 @@ def main():
                 try: vrd.ProgramExit()
                 except Exception: pass
         except Exception as exc:
-            print(f'ERROR: could not resolve ad-scan profile: {exc}',
-                  file=sys.stderr)
+            console.print(f'ERROR: could not resolve ad-scan profile: {exc}',
+                          style='red')
             sys.exit(1)
         finally:
             pythoncom.CoUninitialize()
 
     n_workers = min(args.threads, total)
-    print(f'Found {total} video file(s) in {args.directory!r}')
-    print(f'Workers : {n_workers}')
-    print(f'Profile : {adscan_profile!r}')
+    console.rule('[bold]VideoReDo Batch Ad-Scan[/bold]')
+    console.print(f'  Found    [cyan]{total}[/cyan] video file(s) in [dim]{args.directory!r}[/dim]')
+    console.print(f'  Profile  [cyan]{adscan_profile!r}[/cyan]')
+    console.print(f'  Workers  [cyan]{n_workers}[/cyan]')
     if args.recycle:
-        print('Mode    : --recycle (originals -> recycle bin)')
-    print()
+        console.print('  Mode     [yellow]--recycle[/yellow] (originals → recycle bin)')
+    console.print()
 
     tasks = [
         (i + 1, total, p, args.recycle, adscan_profile)
@@ -480,41 +577,55 @@ def main():
     total_new_bytes  = 0
 
     try:
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            futures = {pool.submit(_worker, t): t for t in tasks}
-            for fut in as_completed(futures):
-                try:
-                    path, success, orig_b, new_b = fut.result()
-                except KeyboardInterrupt:
-                    raise
-                except Exception as exc:
-                    print(f'ERROR (unexpected): {exc}')
-                    errors += 1
-                    continue
-                if success:
-                    processed        += 1
-                    total_orig_bytes += orig_b
-                    total_new_bytes  += new_b
-                else:
-                    # Distinguish error (orig_b==0) from genuine no-ads skip
-                    if orig_b == 0:
-                        errors += 1
-                    else:
-                        skipped += 1
+        with Live(_build_table(), console=console, refresh_per_second=4,
+                  vertical_overflow='visible') as live:
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                futures = {pool.submit(_worker, t): t for t in tasks}
+                pending = set(futures.keys())
+                while pending:
+                    live.update(_build_table())
+                    done, pending = _fut_wait(
+                        pending, timeout=0.25, return_when=FIRST_COMPLETED
+                    )
+                    for fut in done:
+                        try:
+                            path, success, orig_b, new_b = fut.result()
+                        except KeyboardInterrupt:
+                            raise
+                        except Exception as exc:
+                            _log(f'[red]ERROR (unexpected): {exc}[/red]')
+                            errors += 1
+                            continue
+                        if success:
+                            processed        += 1
+                            total_orig_bytes += orig_b
+                            total_new_bytes  += new_b
+                        else:
+                            if orig_b == 0:
+                                errors += 1
+                            else:
+                                skipped += 1
+                live.update(_build_table())
     except KeyboardInterrupt:
-        print('\nInterrupted.')
+        _stop_event.set()
+        _log('\n[yellow]Stopping... waiting for active workers to finish.[/yellow]')
 
     # ---- Summary -----------------------------------------------------------
-    print('\n' + '-' * 50)
-    print(f'  Files processed  : {processed}')
-    print(f'  Skipped (no ads) : {skipped}')
-    print(f'  Errors           : {errors}')
+    console.print()
+    console.rule()
+    console.print(f'  [bold]Files processed[/bold]   [green]{processed}[/green]')
+    console.print(f'  [bold]Skipped (no ads)[/bold]  [dim]{skipped}[/dim]')
+    if errors:
+        console.print(f'  [bold]Errors[/bold]            [red]{errors}[/red]')
     if processed:
         saved = total_orig_bytes - total_new_bytes
         pct   = saved / total_orig_bytes * 100 if total_orig_bytes else 0.0
-        print(f'  Space saved      : {_fmt_bytes(saved)}'
-              f'  ({_fmt_bytes(total_orig_bytes)} -> '
-              f'{_fmt_bytes(total_new_bytes)}, {pct:.1f}%)')
+        console.print(
+            f'  [bold]Space saved[/bold]       '
+            f'[green]{_fmt_bytes(saved)}[/green]'
+            f'  [dim]({_fmt_bytes(total_orig_bytes)} → '
+            f'{_fmt_bytes(total_new_bytes)}, {pct:.1f}%)[/dim]'
+        )
 
 
 if __name__ == '__main__':
