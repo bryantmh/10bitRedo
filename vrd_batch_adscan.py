@@ -28,6 +28,7 @@ import os
 import sys
 import time
 import threading
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, wait as _fut_wait, FIRST_COMPLETED
 
 try:
@@ -65,6 +66,10 @@ SCAN_TIMEOUT       = 3600   # 1 h max for a single scan
 SAVE_POLL_INTERVAL = 2.0    # seconds between save-complete polls
 SAVE_TIMEOUT       = 14400  # 4 h max for a single file (scan+save)
 LOAD_TIMEOUT       = 60     # seconds to wait for a file to load
+# False-positive filter: a cut with exactly 2 scene marks whose marks are
+# spread more than this many seconds apart is considered spurious and removed.
+# Increase to be more aggressive; decrease to keep more marginal cuts.
+SPARSE_CUT_MAX_SPREAD_SECS = 120
 
 _stop_event = threading.Event()
 
@@ -199,6 +204,71 @@ def _wait_for(check_fn, timeout: float, interval: float,
 #  Core per-file logic
 # ---------------------------------------------------------------------------
 
+def _filter_vprj_cuts(vrd, vprj_path: str, label: str) -> int:
+    """
+    Open vprj_path via COM, count scene marks per cut, remove cuts with fewer
+    than MIN_SCENE_MARKS_PER_CUT marks (false-positive filter), and rewrite
+    the Vprj XML.  Returns number of cuts removed.  Leaves vrd closed.
+    """
+    if not bool(vrd.FileOpen(vprj_path, False)):
+        return 0
+    deadline = time.monotonic() + LOAD_TIMEOUT
+    while time.monotonic() < deadline:
+        if int(vrd.NavigationGetState) != 0:
+            break
+        time.sleep(0.5)
+    else:
+        vrd.FileClose()
+        return 0
+
+    n_cuts = int(vrd.EditGetEditsListCount)
+    cuts   = [(int(vrd.EditGetEditStartTime(i)), int(vrd.EditGetEditEndTime(i)))
+              for i in range(n_cuts)]
+    n_marks = int(vrd.SceneMarksGetCount)
+    marks   = [int(vrd.SceneMarksGetSceneMarkTime(i)) for i in range(n_marks)]
+    vrd.FileClose()
+
+    if n_cuts == 0:
+        return 0
+
+    valid_cuts = []
+    for s, e in cuts:
+        cut_marks = sorted(m for m in marks if s <= m <= e)
+        is_sparse = (
+            len(cut_marks) == 2
+            and (cut_marks[1] - cut_marks[0]) > SPARSE_CUT_MAX_SPREAD_SECS * 1000
+        )
+        if not is_sparse:
+            valid_cuts.append((s, e))
+    removed = n_cuts - len(valid_cuts)
+    if removed == 0:
+        return 0
+
+    _log(
+        f'[yellow]  {label}filtered {removed} false-positive cut(s): '
+        f'{n_cuts} \u2192 {len(valid_cuts)} cuts '
+        f'(2 marks > {SPARSE_CUT_MAX_SPREAD_SECS}s apart)[/yellow]'
+    )
+
+    # Rewrite the Vprj XML — only the CutList; leave everything else intact.
+    # Vprj times are in 100-nanosecond units; COM returns milliseconds.
+    tree = ET.parse(vprj_path)
+    root = tree.getroot()
+    cl = root.find('CutList')
+    if cl is not None:
+        for c in list(cl.findall('cut')):
+            cl.remove(c)
+        num_el = cl.find('NumberOfCuts')
+        if num_el is not None:
+            num_el.text = str(len(valid_cuts))
+        for s_ms, e_ms in valid_cuts:
+            cut_el = ET.SubElement(cl, 'cut')
+            ET.SubElement(cut_el, 'CutTimeStart').text = str(s_ms * 10000)
+            ET.SubElement(cut_el, 'CutTimeEnd').text  = str(e_ms * 10000)
+    tree.write(vprj_path, xml_declaration=True, encoding='utf-8')
+    return removed
+
+
 def _find_adscan_profile(vrd) -> str:
     """Return the name of the first enabled ad-scan profile, or raise."""
     n = int(vrd.ProfilesGetCount)
@@ -253,7 +323,8 @@ def process_file(vrd, path: str, recycle: bool,
       success=False, err_msg='…' -> an error occurred
     """
     stem, ext = os.path.splitext(path)
-    temp_output = stem + '_no_ads' + ext
+    fname       = os.path.basename(path)
+    temp_output = stem + '_no_ads.mkv'
     temp_vprj   = stem + '_no_ads.Vprj'
     orig_size   = os.path.getsize(path)
     native_path = os.path.normpath(path)
@@ -297,6 +368,10 @@ def process_file(vrd, path: str, recycle: bool,
     if not os.path.isfile(temp_vprj):
         status_fn(phase='Error')
         return False, 0, 0, 0, 'Scan produced no project file'
+
+    # -- False-positive filter -----------------------------------------------
+    # Remove cuts whose scene-mark density is too low to be a real ad block.
+    _filter_vprj_cuts(vrd, temp_vprj, label=f'{fname}: ')
 
     # -- Phase 2: reopen project, save with cuts applied ---------------------
     status_fn(phase='Loading')
@@ -356,7 +431,9 @@ def process_file(vrd, path: str, recycle: bool,
             _log(f'[yellow]  WARNING: Could not recycle original: {e}[/yellow]')
             return True, orig_size, new_size, n_cuts, None
         try:
-            os.rename(temp_output, path)
+            # Source may be a different container (e.g. .flv, .mp4); output
+            # is always .mkv, so rename to stem + .mkv rather than orig path.
+            os.rename(temp_output, stem + '.mkv')
         except Exception as e:
             _log(f'[yellow]  WARNING: Recycle OK but rename failed: {e}[/yellow]')
 
