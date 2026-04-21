@@ -74,6 +74,13 @@ SPARSE_CUT_MAX_SPREAD_SECS = 55
 # file start, treat 0 -> first_mark as a pre-roll/intro and cut it.  Gates
 # the feature so we don't accidentally chop off a long opening scene.
 INTRO_MAX_SECS = 15
+# --protect-edges: drop any scan-detected cut that overlaps the first
+# PROTECT_START_SECS or the last PROTECT_END_SECS of the file.  This is
+# meant to keep recaps/cold-opens at the start and end-credits at the end.
+# The --drop-intro cut (0 -> first scene mark, capped at INTRO_MAX_SECS) is
+# exempt — it's applied AFTER this filter, in Phase 2 via COM.
+PROTECT_START_SECS = 60
+PROTECT_END_SECS   = 60
 
 _stop_event = threading.Event()
 
@@ -241,11 +248,14 @@ def _apply_intro_cut(vrd, label: str) -> bool:
     return True
 
 
-def _filter_vprj_cuts(vrd, vprj_path: str, label: str) -> int:
+def _filter_vprj_cuts(vrd, vprj_path: str, label: str,
+                      protect_edges: bool = False) -> int:
     """
     Split each cut on scene-mark gaps > SPARSE_CUT_MAX_SPREAD_SECS and drop
-    single-mark outlier runs.  Rewrites the Vprj XML if anything changed.
-    Returns net change in cut count (positive = removed, negative = added).
+    single-mark outlier runs.  If protect_edges is set, also drop any cut
+    that overlaps the first PROTECT_START_SECS or last PROTECT_END_SECS of
+    the file.  Rewrites the Vprj XML if anything changed.  Returns net
+    change in cut count (positive = removed, negative = added).
     Leaves vrd closed.
     """
     if not bool(vrd.FileOpen(vprj_path, False)):
@@ -264,6 +274,10 @@ def _filter_vprj_cuts(vrd, vprj_path: str, label: str) -> int:
               for i in range(n_cuts)]
     n_marks = int(vrd.SceneMarksGetCount)
     marks   = sorted(int(vrd.SceneMarksGetSceneMarkTime(i)) for i in range(n_marks))
+    try:
+        duration_ms = int(vrd.FileGetOpenedFileDuration)
+    except Exception:
+        duration_ms = 0
     vrd.FileClose()
 
     if n_cuts == 0:
@@ -312,6 +326,29 @@ def _filter_vprj_cuts(vrd, vprj_path: str, label: str) -> int:
             f'{n_cuts} \u2192 {len(valid_cuts)} '
             f'(gap threshold {SPARSE_CUT_MAX_SPREAD_SECS}s)[/yellow]'
         )
+
+    # Edge protection: drop any cut overlapping the first PROTECT_START_SECS
+    # or the last PROTECT_END_SECS of the file.  The --drop-intro cut is
+    # applied later, via COM, and is intentionally exempt.
+    if protect_edges and valid_cuts:
+        start_zone_end = PROTECT_START_SECS * 1000
+        end_zone_start = (duration_ms - PROTECT_END_SECS * 1000
+                          if duration_ms > 0 else None)
+        before = len(valid_cuts)
+        kept = []
+        for s, e in valid_cuts:
+            if e > 0 and s < start_zone_end:
+                continue  # overlaps first-minute zone
+            if end_zone_start is not None and e > end_zone_start:
+                continue  # overlaps last-minute zone
+            kept.append((s, e))
+        if len(kept) != before:
+            _log(
+                f'[yellow]  {label}edge-protected: '
+                f'{before} \u2192 {len(kept)} '
+                f'(first {PROTECT_START_SECS}s / last {PROTECT_END_SECS}s)[/yellow]'
+            )
+        valid_cuts = kept
 
     if valid_cuts == cuts:
         return 0
@@ -363,6 +400,7 @@ def process_file(vrd, path: str, recycle: bool,
                  adscan_profile: str,
                  drop_intro: bool = False,
                  skip_if_single_cut: bool = False,
+                 protect_edges: bool = False,
                  *,
                  status_fn) -> tuple:
     """
@@ -440,7 +478,8 @@ def process_file(vrd, path: str, recycle: bool,
 
     # -- False-positive filter -----------------------------------------------
     # Remove cuts whose scene-mark density is too low to be a real ad block.
-    _filter_vprj_cuts(vrd, temp_vprj, label=f'{fname}: ')
+    _filter_vprj_cuts(vrd, temp_vprj, label=f'{fname}: ',
+                      protect_edges=protect_edges)
 
     # -- Phase 2: reopen project, save with cuts applied ---------------------
     status_fn(phase='Loading')
@@ -539,7 +578,8 @@ def _worker(task: tuple) -> tuple:
     Process one file. Each call launches its own VideoReDo silent instance
     so workers can run in parallel.
     """
-    idx, total, path, recycle, adscan_profile, drop_intro, skip_if_single_cut = task
+    (idx, total, path, recycle, adscan_profile,
+     drop_intro, skip_if_single_cut, protect_edges) = task
     fname = os.path.basename(path)
 
     _set_slot(idx, total=total, fname=fname, phase='Loading')
@@ -559,6 +599,7 @@ def _worker(task: tuple) -> tuple:
             vrd, path, recycle, adscan_profile,
             drop_intro=drop_intro,
             skip_if_single_cut=skip_if_single_cut,
+            protect_edges=protect_edges,
             status_fn=status_fn,
         )
         elapsed = _fmt_elapsed(time.monotonic() - t0)
@@ -657,6 +698,11 @@ def main():
                              'saving entirely (treat it as no ads).  Useful when '
                              'a lone cut is more likely a false positive than a '
                              'real commercial block.')
+    parser.add_argument('--protect-edges', action='store_true',
+                        help=f'Drop any scan-detected cut that overlaps the '
+                             f'first {PROTECT_START_SECS}s or last {PROTECT_END_SECS}s '
+                             f'of the file, to preserve recaps/cold-opens and '
+                             f'credits.  The --drop-intro cut is exempt.')
     args = parser.parse_args()
 
     try:
@@ -737,11 +783,14 @@ def main():
         console.print('  Mode     [yellow]--drop-intro[/yellow] (remove intro before first scene mark)')
     if args.skip_if_single_cut:
         console.print('  Mode     [yellow]--skip-if-single-cut[/yellow] (skip files where only 1 cut is detected)')
+    if args.protect_edges:
+        console.print(f'  Mode     [yellow]--protect-edges[/yellow] '
+                      f'(drop cuts in first {PROTECT_START_SECS}s / last {PROTECT_END_SECS}s)')
     console.print()
 
     tasks = [
         (i + 1, total, p, args.recycle, adscan_profile,
-         args.drop_intro, args.skip_if_single_cut)
+         args.drop_intro, args.skip_if_single_cut, args.protect_edges)
         for i, p in enumerate(videos)
     ]
 
