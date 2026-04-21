@@ -70,6 +70,10 @@ LOAD_TIMEOUT       = 60     # seconds to wait for a file to load
 # spread more than this many seconds apart is considered spurious and removed.
 # Increase to be more aggressive; decrease to keep more marginal cuts.
 SPARSE_CUT_MAX_SPREAD_SECS = 120
+# --drop-intro: if the first scene mark is within this many seconds of the
+# file start, treat 0 -> first_mark as a pre-roll/intro and cut it.  Gates
+# the feature so we don't accidentally chop off a long opening scene.
+INTRO_MAX_SECS = 15
 
 _stop_event = threading.Event()
 
@@ -204,11 +208,43 @@ def _wait_for(check_fn, timeout: float, interval: float,
 #  Core per-file logic
 # ---------------------------------------------------------------------------
 
+def _apply_intro_cut(vrd, label: str) -> bool:
+    """
+    Prepend a cut from 0 -> first scene mark if that mark is within
+    INTRO_MAX_SECS.  Must be called with a Vprj already open in vrd.
+    Returns True if a cut was added.
+    """
+    n_marks = int(vrd.SceneMarksGetCount)
+    marks = sorted(int(vrd.SceneMarksGetSceneMarkTime(i)) for i in range(n_marks))
+    # VRD sometimes places a scene mark at time 0; we want the first real boundary.
+    first_mark = next((m for m in marks if m > 0), 0)
+
+    n_cuts = int(vrd.EditGetEditsListCount)
+    starts = [int(vrd.EditGetEditStartTime(i)) for i in range(n_cuts)]
+    already_cut_from_zero = any(s == 0 for s in starts)
+
+    if first_mark == 0:
+        _log(f'[dim]  {label}skipping intro drop (no scene marks > 0)[/dim]')
+        return False
+    if already_cut_from_zero:
+        _log(f'[dim]  {label}skipping intro drop (cut already starts at 0)[/dim]')
+        return False
+    if first_mark > INTRO_MAX_SECS * 1000:
+        _log(f'[dim]  {label}skipping intro drop '
+             f'(first mark at {first_mark / 1000:.1f}s > {INTRO_MAX_SECS}s threshold)[/dim]')
+        return False
+
+    vrd.EditSetSelectionStart(0)
+    vrd.EditSetSelectionEnd(first_mark)
+    vrd.EditAddSelection()
+    _log(f'[yellow]  {label}dropped intro (0 → {first_mark / 1000:.1f}s)[/yellow]')
+    return True
+
+
 def _filter_vprj_cuts(vrd, vprj_path: str, label: str) -> int:
     """
-    Open vprj_path via COM, count scene marks per cut, remove cuts with fewer
-    than MIN_SCENE_MARKS_PER_CUT marks (false-positive filter), and rewrite
-    the Vprj XML.  Returns number of cuts removed.  Leaves vrd closed.
+    Apply the sparse-cut false-positive filter.  Rewrites the Vprj XML if any
+    cuts are removed.  Returns the number of cuts removed.  Leaves vrd closed.
     """
     if not bool(vrd.FileOpen(vprj_path, False)):
         return 0
@@ -225,7 +261,7 @@ def _filter_vprj_cuts(vrd, vprj_path: str, label: str) -> int:
     cuts   = [(int(vrd.EditGetEditStartTime(i)), int(vrd.EditGetEditEndTime(i)))
               for i in range(n_cuts)]
     n_marks = int(vrd.SceneMarksGetCount)
-    marks   = [int(vrd.SceneMarksGetSceneMarkTime(i)) for i in range(n_marks)]
+    marks   = sorted(int(vrd.SceneMarksGetSceneMarkTime(i)) for i in range(n_marks))
     vrd.FileClose()
 
     if n_cuts == 0:
@@ -241,14 +277,15 @@ def _filter_vprj_cuts(vrd, vprj_path: str, label: str) -> int:
         if not is_sparse:
             valid_cuts.append((s, e))
     removed = n_cuts - len(valid_cuts)
-    if removed == 0:
-        return 0
-
-    _log(
-        f'[yellow]  {label}filtered {removed} false-positive cut(s): '
+    if removed > 0:
+        _log(
+            f'[yellow]  {label}filtered {removed} false-positive cut(s): '
         f'{n_cuts} \u2192 {len(valid_cuts)} cuts '
-        f'(2 marks > {SPARSE_CUT_MAX_SPREAD_SECS}s apart)[/yellow]'
-    )
+            f'(2 marks > {SPARSE_CUT_MAX_SPREAD_SECS}s apart)[/yellow]'
+        )
+
+    if removed == 0 and len(valid_cuts) == len(cuts):
+        return 0
 
     # Rewrite the Vprj XML — only the CutList; leave everything else intact.
     # Vprj times are in 100-nanosecond units; COM returns milliseconds.
@@ -295,6 +332,8 @@ def _open_and_wait(vrd, path: str, status_fn) -> bool:
 
 def process_file(vrd, path: str, recycle: bool,
                  adscan_profile: str,
+                 drop_intro: bool = False,
+                 *,
                  status_fn) -> tuple:
     """
     Run ad-scan + VRD native save on one file.
@@ -379,6 +418,12 @@ def process_file(vrd, path: str, recycle: bool,
         _cleanup_vprj(temp_vprj)
         return False, 0, 0, 0, 'Failed to open project file'
 
+    # Optionally prepend an intro cut (0 -> first scene mark) via COM.
+    # This is done AFTER the Vprj reload so VRD's in-memory edits list is
+    # authoritative — editing the XML doesn't reliably propagate through save.
+    if drop_intro:
+        _apply_intro_cut(vrd, label=f'{fname}: ')
+
     n_cuts = int(vrd.EditGetEditsListCount)
     status_fn(phase='Scanning', pct=100.0, cuts=n_cuts)
 
@@ -457,7 +502,7 @@ def _worker(task: tuple) -> tuple:
     Process one file. Each call launches its own VideoReDo silent instance
     so workers can run in parallel.
     """
-    idx, total, path, recycle, adscan_profile = task
+    idx, total, path, recycle, adscan_profile, drop_intro = task
     fname = os.path.basename(path)
 
     _set_slot(idx, total=total, fname=fname, phase='Loading')
@@ -474,7 +519,7 @@ def _worker(task: tuple) -> tuple:
         vrd_silent = win32com.client.Dispatch('VideoReDo6.VideoReDoSilent')
         vrd = vrd_silent.VRDInterface
         success, orig_b, new_b, n_cuts, err_msg = process_file(
-            vrd, path, recycle, adscan_profile, status_fn=status_fn
+            vrd, path, recycle, adscan_profile, drop_intro=drop_intro, status_fn=status_fn
         )
         elapsed = _fmt_elapsed(time.monotonic() - t0)
         cuts_str = (f'  [bright_white]{n_cuts} cut{"s" if n_cuts != 1 else ""}[/bright_white]'
@@ -564,6 +609,9 @@ def main():
                              'ad-scan profile).  See --list-profiles.')
     parser.add_argument('--list-profiles', action='store_true',
                         help='Print available VideoReDo profiles and exit')
+    parser.add_argument('--drop-intro', action='store_true',
+                        help='Remove the opening segment before the first scene mark '
+                             'from every output file.')
     args = parser.parse_args()
 
     try:
@@ -640,10 +688,12 @@ def main():
     console.print(f'  Workers  [cyan]{n_workers}[/cyan]')
     if args.recycle:
         console.print('  Mode     [yellow]--recycle[/yellow] (originals → recycle bin)')
+    if args.drop_intro:
+        console.print('  Mode     [yellow]--drop-intro[/yellow] (remove intro before first scene mark)')
     console.print()
 
     tasks = [
-        (i + 1, total, p, args.recycle, adscan_profile)
+        (i + 1, total, p, args.recycle, adscan_profile, args.drop_intro)
         for i, p in enumerate(videos)
     ]
 
