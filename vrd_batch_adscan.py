@@ -69,7 +69,7 @@ LOAD_TIMEOUT       = 60     # seconds to wait for a file to load
 # False-positive filter: a cut with exactly 2 scene marks whose marks are
 # spread more than this many seconds apart is considered spurious and removed.
 # Increase to be more aggressive; decrease to keep more marginal cuts.
-SPARSE_CUT_MAX_SPREAD_SECS = 120
+SPARSE_CUT_MAX_SPREAD_SECS = 55
 # --drop-intro: if the first scene mark is within this many seconds of the
 # file start, treat 0 -> first_mark as a pre-roll/intro and cut it.  Gates
 # the feature so we don't accidentally chop off a long opening scene.
@@ -243,8 +243,10 @@ def _apply_intro_cut(vrd, label: str) -> bool:
 
 def _filter_vprj_cuts(vrd, vprj_path: str, label: str) -> int:
     """
-    Apply the sparse-cut false-positive filter.  Rewrites the Vprj XML if any
-    cuts are removed.  Returns the number of cuts removed.  Leaves vrd closed.
+    Split each cut on scene-mark gaps > SPARSE_CUT_MAX_SPREAD_SECS and drop
+    single-mark outlier runs.  Rewrites the Vprj XML if anything changed.
+    Returns net change in cut count (positive = removed, negative = added).
+    Leaves vrd closed.
     """
     if not bool(vrd.FileOpen(vprj_path, False)):
         return 0
@@ -267,24 +269,51 @@ def _filter_vprj_cuts(vrd, vprj_path: str, label: str) -> int:
     if n_cuts == 0:
         return 0
 
+    # For each cut, split its scene marks into runs separated by gaps larger
+    # than SPARSE_CUT_MAX_SPREAD_SECS.  Each dense run (>=2 marks) becomes one
+    # cut; single-mark runs are dropped as outliers.  The original cut's outer
+    # bounds are preserved only when the neighbouring run was NOT a dropped
+    # outlier — otherwise the new edge is tightened to the dense run's own
+    # first/last mark.
+    gap_ms = SPARSE_CUT_MAX_SPREAD_SECS * 1000
     valid_cuts = []
     for s, e in cuts:
         cut_marks = sorted(m for m in marks if s <= m <= e)
-        is_sparse = (
-            len(cut_marks) == 2
-            and (cut_marks[1] - cut_marks[0]) > SPARSE_CUT_MAX_SPREAD_SECS * 1000
-        )
-        if not is_sparse:
+        if len(cut_marks) <= 1:
+            # No marks or a single mark -> keep original cut as-is.
             valid_cuts.append((s, e))
+            continue
+
+        runs = [[cut_marks[0]]]
+        for m in cut_marks[1:]:
+            if m - runs[-1][-1] > gap_ms:
+                runs.append([m])
+            else:
+                runs[-1].append(m)
+
+        dense_runs = [r for r in runs if len(r) >= 2]
+        if not dense_runs:
+            continue  # every run was a single-mark outlier -> drop the cut
+
+        # Preserve the outer bound only if no outlier run was dropped on that side.
+        keep_start = runs[0]  is dense_runs[0]
+        keep_end   = runs[-1] is dense_runs[-1]
+
+        for run in dense_runs:
+            sub_s = s if (run is dense_runs[0]  and keep_start) else run[0]
+            sub_e = e if (run is dense_runs[-1] and keep_end)   else run[-1]
+            valid_cuts.append((sub_s, sub_e))
+
     removed = n_cuts - len(valid_cuts)
-    if removed > 0:
+    if removed != 0:
+        direction = 'filtered' if removed > 0 else 'split'
         _log(
-            f'[yellow]  {label}filtered {removed} false-positive cut(s): '
-        f'{n_cuts} \u2192 {len(valid_cuts)} cuts '
-            f'(2 marks > {SPARSE_CUT_MAX_SPREAD_SECS}s apart)[/yellow]'
+            f'[yellow]  {label}{direction} cuts: '
+            f'{n_cuts} \u2192 {len(valid_cuts)} '
+            f'(gap threshold {SPARSE_CUT_MAX_SPREAD_SECS}s)[/yellow]'
         )
 
-    if removed == 0 and len(valid_cuts) == len(cuts):
+    if valid_cuts == cuts:
         return 0
 
     # Rewrite the Vprj XML — only the CutList; leave everything else intact.
@@ -314,7 +343,7 @@ def _find_adscan_profile(vrd) -> str:
                 and bool(vrd.ProfilesGetProfileIsEnabled(i))):
             return str(vrd.ProfilesGetProfileName(i))
     raise RuntimeError('No enabled ad-scan profile found in VideoReDo. '
-                       'Open VRD and create one under Tools > Output Profiles.')
+                       'Open VRD and create one under Ad-Detective > Set Ad-Detective Parameters')
 
 
 def _open_and_wait(vrd, path: str, status_fn) -> bool:
@@ -333,6 +362,7 @@ def _open_and_wait(vrd, path: str, status_fn) -> bool:
 def process_file(vrd, path: str, recycle: bool,
                  adscan_profile: str,
                  drop_intro: bool = False,
+                 skip_if_single_cut: bool = False,
                  *,
                  status_fn) -> tuple:
     """
@@ -433,6 +463,13 @@ def process_file(vrd, path: str, recycle: bool,
         _cleanup_vprj(temp_vprj)
         return False, orig_size, 0, 0, ''
 
+    if skip_if_single_cut and n_cuts == 1:
+        _log(f'[dim]  {fname}: skipping (only 1 cut detected)[/dim]')
+        status_fn(phase='No ads')
+        vrd.FileClose()
+        _cleanup_vprj(temp_vprj)
+        return False, orig_size, 0, 0, ''
+
     if os.path.exists(temp_output):
         os.remove(temp_output)
 
@@ -502,7 +539,7 @@ def _worker(task: tuple) -> tuple:
     Process one file. Each call launches its own VideoReDo silent instance
     so workers can run in parallel.
     """
-    idx, total, path, recycle, adscan_profile, drop_intro = task
+    idx, total, path, recycle, adscan_profile, drop_intro, skip_if_single_cut = task
     fname = os.path.basename(path)
 
     _set_slot(idx, total=total, fname=fname, phase='Loading')
@@ -519,7 +556,10 @@ def _worker(task: tuple) -> tuple:
         vrd_silent = win32com.client.Dispatch('VideoReDo6.VideoReDoSilent')
         vrd = vrd_silent.VRDInterface
         success, orig_b, new_b, n_cuts, err_msg = process_file(
-            vrd, path, recycle, adscan_profile, drop_intro=drop_intro, status_fn=status_fn
+            vrd, path, recycle, adscan_profile,
+            drop_intro=drop_intro,
+            skip_if_single_cut=skip_if_single_cut,
+            status_fn=status_fn,
         )
         elapsed = _fmt_elapsed(time.monotonic() - t0)
         cuts_str = (f'  [bright_white]{n_cuts} cut{"s" if n_cuts != 1 else ""}[/bright_white]'
@@ -598,8 +638,8 @@ def main():
     )
     parser.add_argument('directory', nargs='?', default=None,
                         help='Root folder of videos to process')
-    parser.add_argument('--threads', type=int, default=8,
-                        help='Parallel VideoReDo instances to run (default: 8)')
+    parser.add_argument('--threads', type=int, default=6,
+                        help='Parallel VideoReDo instances to run (default: 6)')
     parser.add_argument('--recycle', action='store_true',
                         help='Send the original to the recycle bin and rename '
                              'the output to take its place')
@@ -612,6 +652,11 @@ def main():
     parser.add_argument('--drop-intro', action='store_true',
                         help='Remove the opening segment before the first scene mark '
                              'from every output file.')
+    parser.add_argument('--skip-if-single-cut', action='store_true',
+                        help='If only a single cut is detected for a file, skip '
+                             'saving entirely (treat it as no ads).  Useful when '
+                             'a lone cut is more likely a false positive than a '
+                             'real commercial block.')
     args = parser.parse_args()
 
     try:
@@ -690,10 +735,13 @@ def main():
         console.print('  Mode     [yellow]--recycle[/yellow] (originals → recycle bin)')
     if args.drop_intro:
         console.print('  Mode     [yellow]--drop-intro[/yellow] (remove intro before first scene mark)')
+    if args.skip_if_single_cut:
+        console.print('  Mode     [yellow]--skip-if-single-cut[/yellow] (skip files where only 1 cut is detected)')
     console.print()
 
     tasks = [
-        (i + 1, total, p, args.recycle, adscan_profile, args.drop_intro)
+        (i + 1, total, p, args.recycle, adscan_profile,
+         args.drop_intro, args.skip_if_single_cut)
         for i, p in enumerate(videos)
     ]
 
