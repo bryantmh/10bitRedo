@@ -241,10 +241,21 @@ def save_vrd(vrd, source_path: str, vprj_path: str, *,
             pct = 0.0
         status_fn(phase='Saving', pct=pct, cuts=n_cuts)
 
-    save_done = _wait_for(
-        lambda: int(vrd.OutputGetState) == OUTPUT_NONE,
-        SAVE_TIMEOUT, SAVE_POLL_INTERVAL, _save_tick,
+    # FileSaveAs is asynchronous and OutputGetState can still read
+    # OUTPUT_NONE for a moment after it returns.  Wait for the save engine
+    # to actually start before polling for completion, otherwise a slow
+    # start is mistaken for a finished save.
+    started = _wait_for(
+        lambda: int(vrd.OutputGetState) != OUTPUT_NONE, 30, 0.25,
     )
+    save_done = True
+    if started:
+        save_done = _wait_for(
+            lambda: int(vrd.OutputGetState) == OUTPUT_NONE,
+            SAVE_TIMEOUT, SAVE_POLL_INTERVAL, _save_tick,
+        )
+    # If the save never left OUTPUT_NONE it may have finished within the
+    # first poll; the output-file check below is the arbiter.
 
     vrd.FileClose()
 

@@ -17,6 +17,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, wait as _fut_wait, FIRST_COMPLETED
 
@@ -56,6 +57,10 @@ def _run_comskip(src: str, out_dir: str, out_stem: str,
     `out_stem`.  Returns the path to the produced .VPrj on success, else None.
     Streams stdout to drive the live-dashboard percent indicator.
     """
+    # Remove leftovers from a previous (possibly interrupted) run so a stale
+    # .VPrj can't be mistaken for this run's result if Comskip fails.
+    _cleanup_comskip_outputs(out_dir, out_stem)
+
     args = [
         comskip_exe,
         '--videoredo3',
@@ -88,14 +93,31 @@ def _run_comskip(src: str, out_dir: str, out_stem: str,
         **popen_kwargs,
     )
     assert proc.stdout is not None
-    deadline = time.monotonic() + COMSKIP_TIMEOUT
+
+    # The read loop blocks on Comskip's stdout, so a Comskip that hangs
+    # without producing output would never hit an inline deadline check.
+    # Enforce the timeout out-of-band: killing the process closes the pipe
+    # and unblocks the read.
+    timed_out = threading.Event()
+
+    def _on_timeout():
+        timed_out.set()
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    watchdog = threading.Timer(COMSKIP_TIMEOUT, _on_timeout)
+    watchdog.daemon = True
+    watchdog.start()
+
     buf = ''
     try:
         while True:
             chunk = proc.stdout.read(256)
             if not chunk:
                 break
-            if time.monotonic() > deadline:
+            if bvs._stop_event.is_set():
                 proc.kill()
                 return None
             buf += chunk.replace('\r', '\n')
@@ -110,10 +132,14 @@ def _run_comskip(src: str, out_dir: str, out_stem: str,
                         continue
                     status_fn(phase='Comskip', pct=pct, pos=pos_str)
     finally:
+        watchdog.cancel()
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+
+    if timed_out.is_set() or bvs._stop_event.is_set():
+        return None
 
     vprj = os.path.join(out_dir, out_stem + '.VPrj')
     return vprj if os.path.isfile(vprj) else None
@@ -136,9 +162,11 @@ def process_file(vrd, path: str, recycle: bool,
     Run Comskip on `path`, then hand its Vprj to VRD for the cut-and-save.
     Returns (success, orig_bytes, new_bytes, n_cuts, err_msg).
     """
-    stem, _ext = os.path.splitext(path)
-    out_dir    = os.path.dirname(path)
-    out_stem   = os.path.basename(stem) + '_comskip'
+    stem, ext = os.path.splitext(path)
+    out_dir   = os.path.dirname(path)
+    # Include the source extension so "show.mp4" and "show.mkv" in the same
+    # folder don't clobber each other's Comskip outputs when run in parallel.
+    out_stem  = f'{os.path.basename(stem)}_{ext.lstrip(".").lower()}_comskip'
 
     vprj = _run_comskip(
         path, out_dir, out_stem, comskip_exe, comskip_ini, status_fn,
@@ -291,12 +319,12 @@ def main():
     processed = skipped = errors = 0
     total_orig_bytes = total_new_bytes = 0
 
-    try:
-        with Live(_build_table(), console=console, refresh_per_second=4,
-                  vertical_overflow='visible') as live:
-            with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                futures = {pool.submit(_worker, t): t for t in tasks}
-                pending = set(futures.keys())
+    with Live(_build_table(), console=console, refresh_per_second=4,
+              vertical_overflow='visible') as live:
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = {pool.submit(_worker, t): t for t in tasks}
+            pending = set(futures.keys())
+            try:
                 while pending:
                     live.update(_build_table())
                     done, pending = _fut_wait(
@@ -321,9 +349,13 @@ def main():
                             else:
                                 skipped += 1
                 live.update(_build_table())
-    except KeyboardInterrupt:
-        bvs._stop_event.set()
-        _log('\n[yellow]Stopping... waiting for active workers to finish.[/yellow]')
+            except KeyboardInterrupt:
+                # Signal BEFORE the executor's __exit__ starts waiting on
+                # running workers, or shutdown blocks until every active
+                # Comskip/VRD run finishes naturally (potentially hours).
+                bvs._stop_event.set()
+                pool.shutdown(wait=False, cancel_futures=True)
+                _log('\n[yellow]Stopping... waiting for active workers to finish.[/yellow]')
 
     console.print()
     console.rule()

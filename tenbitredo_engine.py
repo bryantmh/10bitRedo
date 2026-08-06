@@ -45,6 +45,7 @@ class VideoInfo:
     fps_num: int = 0
     fps_den: int = 1
     duration: float = 0.0
+    start_time: float = 0.0
     bitrate: int = 0
     color_space: str = ""
     color_transfer: str = ""
@@ -55,6 +56,7 @@ class VideoInfo:
     audio_channels: int = 0
     audio_sample_rate: int = 0
     nb_audio_streams: int = 0
+    has_bframes: int = 0
 
     @property
     def fps(self) -> float:
@@ -63,6 +65,37 @@ class VideoInfo:
     @property
     def is_10bit(self) -> bool:
         return self.bit_depth >= 10 or "10" in self.pix_fmt
+
+    @property
+    def encode_profile(self) -> tuple:
+        """(-profile:v, -pix_fmt) matching this source's bit depth.
+
+        Re-encoded spans share a track with stream-copied source packets, so
+        the encode must produce the same bit depth the source already has.
+        Chroma subsampling is preserved for the same reason; anything we
+        don't recognise falls back to 4:2:0 at the source's depth.
+        """
+        depth = 10 if self.is_10bit else 8
+        chroma = "420"
+        for c in ("444", "422", "420"):
+            if c in self.pix_fmt:
+                chroma = c
+                break
+        # HEVC defines no 8-bit 4:2:2 profile, so 4:2:2 always encodes at
+        # 10-bit.  That is safe for smart copy: a 4:2:2 source is already
+        # 10-bit in practice, and a promoted one re-encodes end to end
+        # because its copied packets would not match (see _plan_one).
+        if chroma == "422":
+            depth = 10
+        profile = {
+            ("420", 8): "main",
+            ("420", 10): "main10",
+            ("422", 10): "main422-10",
+            ("444", 8): "main444-8",
+            ("444", 10): "main444-10",
+        }[(chroma, depth)]
+        pix = f"yuv{chroma}p10le" if depth == 10 else f"yuv{chroma}p"
+        return profile, pix
 
     @property
     def is_hdr(self) -> bool:
@@ -135,24 +168,44 @@ class FFmpegHelper:
                     info.bit_depth = int(bd)
                 elif "10" in info.pix_fmt:
                     info.bit_depth = 10
-                fps_str = s.get("r_frame_rate", "0/1")
-                if "/" in fps_str:
-                    n, d = fps_str.split("/")
-                    info.fps_num, info.fps_den = int(n), int(d)
+                # Prefer avg_frame_rate: r_frame_rate reports the field rate
+                # (2x) on interlaced/telecined streams, which would halve
+                # every frame-duration calculation downstream.
+                for fps_str in (s.get("avg_frame_rate", ""), s.get("r_frame_rate", "")):
+                    if "/" in fps_str:
+                        n, d = fps_str.split("/")
+                        if int(d) and int(n):
+                            info.fps_num, info.fps_den = int(n), int(d)
+                            break
                 info.color_space = s.get("color_space", "")
                 info.color_transfer = s.get("color_transfer", "")
                 info.color_primaries = s.get("color_primaries", "")
+                try:
+                    info.has_bframes = int(s.get("has_b_frames", 0))
+                except (TypeError, ValueError):
+                    info.has_bframes = 0
                 for sd in s.get("side_data_list", []):
                     sdt = sd.get("side_data_type", "")
                     if "Mastering" in sdt:
                         try:
+                            # ffprobe reports rationals ("13250/50000"); x265's
+                            # master-display wants integers in units of 0.00002
+                            # (chromaticity) and 0.0001 cd/m² (luminance).
+                            def _md(key, scale):
+                                v = str(sd[key])
+                                if "/" in v:
+                                    num, den = v.split("/")
+                                    f = int(num) / int(den)
+                                else:
+                                    f = float(v)
+                                return int(round(f * scale))
                             info.master_display = (
-                                f"G({sd['green_x']},{sd['green_y']})"
-                                f"B({sd['blue_x']},{sd['blue_y']})"
-                                f"R({sd['red_x']},{sd['red_y']})"
-                                f"WP({sd['white_point_x']},{sd['white_point_y']})"
-                                f"L({sd['max_luminance']},{sd['min_luminance']})")
-                        except KeyError:
+                                f"G({_md('green_x', 50000)},{_md('green_y', 50000)})"
+                                f"B({_md('blue_x', 50000)},{_md('blue_y', 50000)})"
+                                f"R({_md('red_x', 50000)},{_md('red_y', 50000)})"
+                                f"WP({_md('white_point_x', 50000)},{_md('white_point_y', 50000)})"
+                                f"L({_md('max_luminance', 10000)},{_md('min_luminance', 10000)})")
+                        except (KeyError, ValueError, ZeroDivisionError):
                             pass
                     elif "Content light" in sdt:
                         info.content_light = f"{sd.get('max_content',0)},{sd.get('max_average',0)}"
@@ -175,14 +228,28 @@ class FFmpegHelper:
             info.duration = float(fmt.get("duration", 0))
         if info.bitrate <= 0:
             info.bitrate = int(fmt.get("bit_rate", 0))
+        # Container timestamp offset.  MPEG-TS captures rarely start at 0;
+        # edit-list times are file-relative, so every probed PTS must be
+        # normalized by this.  (ffmpeg's -ss already adds it internally.)
+        try:
+            info.start_time = float(fmt.get("start_time", 0) or 0)
+        except (TypeError, ValueError):
+            info.start_time = 0.0
         return info
 
-    def get_keyframes_near(self, input_file, times, window=30.0):
+    def get_keyframes_near(self, input_file, times, window=30.0, start_time=0.0):
+        """Return keyframe times (file-relative seconds) near each of *times*.
+
+        *times* are file-relative; *start_time* is the container's timestamp
+        offset.  ffprobe's -read_intervals and reported pts_time are absolute,
+        so we shift the probe window up and the results back down.
+        """
         all_kfs = set()
         for t in times:
-            start = max(0.0, t - window)
+            lo = max(0.0, t - window) + start_time
+            hi = t + window + start_time
             cmd = [self.ffprobe, "-v", "quiet",
-                   "-read_intervals", f"{start:.3f}%{t + window:.3f}",
+                   "-read_intervals", f"{lo:.3f}%{hi:.3f}",
                    "-select_streams", "v:0",
                    "-show_entries", "packet=pts_time,flags",
                    "-of", "csv=p=0", input_file]
@@ -192,7 +259,7 @@ class FFmpegHelper:
                 parts = line.strip().split(",")
                 if len(parts) >= 2 and "K" in parts[1]:
                     try:
-                        all_kfs.add(float(parts[0]))
+                        all_kfs.add(float(parts[0]) - start_time)
                     except ValueError:
                         pass
             proc.wait()
@@ -382,7 +449,17 @@ class VRDProjectParser:
             text = text[1:]
         root = ET.fromstring(text)
         if "videoredo" in (root.tag or "").lower() or root.find(".//CutList") is not None:
-            return VRDProjectParser._parse_vrd(root)
+            source, kept = VRDProjectParser._parse_vrd(root)
+            # VPrj files store absolute source paths; if the recording (or
+            # the whole folder) was moved, fall back to the same basename
+            # next to the project file.
+            if source and not os.path.isfile(source):
+                cand = os.path.join(os.path.dirname(os.path.abspath(project_path)),
+                                    os.path.basename(source))
+                if os.path.isfile(cand):
+                    log.info("Project source %s not found; using %s", source, cand)
+                    source = cand
+            return source, kept
         raise ValueError(f"Unrecognized project format: {project_path}")
 
     @staticmethod
@@ -496,6 +573,8 @@ class SmartSave10Bit:
         self._step_base_pct = 10.0
         self._step_pct_span = 0.0
         self._step_expected_dur = 0.001
+        self._seek_direct_first = False
+        self._encoder = None
 
     def set_progress_callback(self, cb):
         self._cb = cb
@@ -538,6 +617,7 @@ class SmartSave10Bit:
 
     def save(self, input_file, segments, output_file):
         self._temp_dir = tempfile.mkdtemp(prefix="vrd10bit_")
+        self._encoder = None    # re-probed per source
         try:
             self._save_impl(input_file, segments, output_file)
         finally:
@@ -551,8 +631,11 @@ class SmartSave10Bit:
                  info.width, info.height, info.codec_name,
                  info.pix_fmt, info.bit_depth, info.fps, info.duration)
         if not info.is_10bit:
-            log.warning("Source is NOT 10-bit (%s %d-bit). Proceeding anyway.",
-                        info.pix_fmt, info.bit_depth)
+            # Re-encoded spans must match the bit depth of the spans we stream
+            # copy, so an 8-bit source stays 8-bit rather than becoming Main 10.
+            log.warning("Source is NOT 10-bit (%s %d-bit); encoding re-rendered "
+                        "spans as %s to stay consistent with the copied ones.",
+                        info.pix_fmt, info.bit_depth, info.encode_profile[0])
 
         boundary_times = []
         for seg in segments:
@@ -564,11 +647,20 @@ class SmartSave10Bit:
             boundary_times = [0.0]
 
         self._report(2, f"Scanning keyframes near {len(boundary_times)} cut boundaries...")
-        keyframes = self.ff.get_keyframes_near(input_file, boundary_times, window=30.0)
+        keyframes = self.ff.get_keyframes_near(input_file, boundary_times, window=30.0,
+                                               start_time=info.start_time)
         self._keyframes = keyframes
         if not keyframes:
             log.warning("No keyframes found near boundaries; will re-encode all segments")
         self._check_cancel()
+
+        # Pick the encoder before planning so the choice is logged once and
+        # reused for every span.  Only matters when some spans get copied --
+        # a full re-encode has no copied packets to stay compatible with.
+        if keyframes:
+            self._report(5, "Matching encoder to the source...")
+            self._pick_encoder(info)
+            self._check_cancel()
 
         self._report(8, "Planning smart edit...")
         plans = self._plan_all(segments, keyframes)
@@ -639,8 +731,6 @@ class SmartSave10Bit:
         if kf_after - seg.start > TOL:
             plan["head"] = (seg.start, kf_after)
         if kf_before - kf_after > TOL:
-            plan["body"] = (kf_after, kf_before)
-        elif plan["head"] is None:
             plan["body"] = (kf_after, kf_before)
         # Always re-encode from kf_before to seg.end (tail)
         if seg.end - kf_before > TOL:
@@ -726,36 +816,53 @@ class SmartSave10Bit:
         # keyframe reliably (its DTS precedes its PTS).  We include extra
         # frames and trim afterward based on PTS.
         #
-        # Seek-offset compensation: ffmpeg's -ss (before -i) with -c copy
-        # on HEVC MKV content consistently lands 1 GOP before the target
-        # keyframe.  We detect this by comparing the first keyframe's packet
-        # size in the intermediate against the expected source keyframe.
-        # If a mismatch is found after the initial (compensated) extraction,
-        # we fall back to the original seek target.
+        # Where ffmpeg's -ss (before -i) with -c copy actually lands is
+        # demuxer-dependent: some files start exactly at the requested
+        # keyframe, others (e.g. HEVC in MKV) one GOP earlier.  _trim_body's
+        # math requires the extraction to begin exactly at the keyframe at
+        # `start`, so we try candidate seek targets and VERIFY the
+        # intermediate's first keyframe matches the source keyframe at
+        # `start` (by packet size).  The strategy that works is remembered
+        # for subsequent segments of the same save.  If no candidate can be
+        # verified, this span is re-encoded instead — slower, but frame-
+        # accurate on every source.
         frame_dur = 1.0 / (info.fps or 24.0)
         duration = end - start + frame_dur  # generous: include 1 extra frame
 
-        # Determine compensated seek target: use next keyframe after start
         kfs = getattr(self, '_keyframes', None) or []
-        seek_target = start
-        compensated = False
-        if kfs:
-            idx = bisect.bisect_right(kfs, start + 0.005)
-            if idx < len(kfs):
-                seek_target = kfs[idx]
-                compensated = True
+        candidates = [start]
+        idx = bisect.bisect_right(kfs, start + 0.005)
+        if idx < len(kfs):
+            # Seeking to the NEXT keyframe compensates demuxers that land
+            # one GOP before the requested target.
+            if getattr(self, '_seek_direct_first', False):
+                candidates.append(kfs[idx])
+            else:
+                candidates.insert(0, kfs[idx])
 
-        self._run_copy_extract(src, seek_target, duration, dst, info, step_cb=step_cb)
-
-        # Verify: intermediate's first KF packet size must match source KF at start
-        if compensated:
-            src_sz = self._probe_kf_packet_size(src, start)
+        src_sz = self._probe_kf_packet_size(src, start, info.start_time)
+        aligned = False
+        for seek in candidates:
+            self._run_copy_extract(src, seek, duration, dst, info, step_cb=step_cb)
+            if src_sz is None:
+                log.warning("Could not probe source keyframe at %.3f; "
+                            "using unverified stream copy", start)
+                break
             int_sz = self._probe_first_kf_packet_size(dst)
-            if src_sz and int_sz and src_sz != int_sz:
-                log.info("Seek compensation wrong (pkt %d vs %d); "
-                         "retrying direct seek to %.3f",
-                         int_sz, src_sz, start)
-                self._run_copy_extract(src, start, duration, dst, info, step_cb=step_cb)
+            if int_sz == src_sz:
+                aligned = True
+                self._seek_direct_first = (seek == start)
+                break
+            log.info("Stream-copy seek to %.3f landed on the wrong keyframe "
+                     "(pkt %s vs %s)", seek, int_sz, src_sz)
+
+        if src_sz is not None and not aligned:
+            log.warning("Stream copy could not be aligned for %.3f-%.3f; "
+                        "re-encoding this span for frame accuracy", start, end)
+            # Exclude the boundary keyframe at `end` (the next part starts there),
+            # mirroring what _trim_body does for a copied body.
+            self._reencode(src, start, end - frame_dur / 2, dst, info, step_cb=step_cb)
+            return
 
         # Trim to exactly the wanted frames (PTS < boundary in the intermediate)
         self._trim_body(dst, start, end, info)
@@ -774,11 +881,12 @@ class SmartSave10Bit:
                      "-f", "matroska", dst])
         self.ff.run(args, step_cb=step_cb)
 
-    def _probe_kf_packet_size(self, path, near_pts):
-        """Return packet size of the keyframe closest to *near_pts*."""
+    def _probe_kf_packet_size(self, path, near_pts, start_time=0.0):
+        """Return packet size of the keyframe closest to file-relative *near_pts*."""
         w = 5.0
+        target = near_pts + start_time
         cmd = [self.ff.ffprobe, "-v", "quiet",
-               "-read_intervals", f"{max(0, near_pts - w):.3f}%{near_pts + w:.3f}",
+               "-read_intervals", f"{max(0, target - w):.3f}%{target + w:.3f}",
                "-select_streams", "v:0",
                "-show_entries", "packet=pts_time,size,flags",
                "-of", "csv=p=0", path]
@@ -789,7 +897,7 @@ class SmartSave10Bit:
             parts = line.strip().split(",")
             if len(parts) >= 3 and "K" in parts[2]:
                 try:
-                    d = abs(float(parts[0]) - near_pts)
+                    d = abs(float(parts[0]) - target)
                     if d < best_dist:
                         best_dist = d
                         best_size = int(parts[1])
@@ -874,6 +982,61 @@ class SmartSave10Bit:
         self.ff.run(args)
         os.replace(tmp, path)
 
+    @staticmethod
+    def _hvcc_param_nals(extra):
+        """Extract the VPS/SPS/PPS payloads from an hvcC record.
+
+        Returns a set of NAL byte strings, or None if `extra` is not hvcC.
+        Only these decide whether a copied packet can be decoded against
+        another encoder's header; the SEI x265 appends (its version string)
+        differs on every build and must not count as an incompatibility.
+        """
+        # hvcC: 22-byte header, then numOfArrays, then per-array
+        # {type, numNalus, [len, payload]...}
+        if len(extra) < 23 or extra[0] != 1:
+            return None
+        nals = set()
+        pos = 22
+        num_arrays = extra[pos]
+        pos += 1
+        for _ in range(num_arrays):
+            if pos + 3 > len(extra):
+                return None
+            nal_type = extra[pos] & 0x3F
+            count = int.from_bytes(extra[pos + 1:pos + 3], "big")
+            pos += 3
+            for _ in range(count):
+                if pos + 2 > len(extra):
+                    return None
+                ln = int.from_bytes(extra[pos:pos + 2], "big")
+                pos += 2
+                if pos + ln > len(extra):
+                    return None
+                # 32=VPS, 33=SPS, 34=PPS.  Ignore anything else (e.g. SEI).
+                if nal_type in (32, 33, 34):
+                    nals.add(bytes(extra[pos:pos + ln]))
+                pos += ln
+        return nals
+
+    def _extradata(self, path):
+        """Return the video track's codec parameter set (SPS/PPS) as bytes."""
+        cmd = [self.ff.ffprobe, "-v", "quiet", "-select_streams", "v:0",
+               "-show_entries", "stream=extradata", "-show_data",
+               "-of", "default=nw=1:nk=1", path]
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=60, creationflags=_SUBPROCESS_FLAGS)
+        blob = bytearray()
+        for line in r.stdout.splitlines():
+            # ffprobe hexdump rows: "00000000: 0101 6000 ... ..`....."
+            if ":" not in line:
+                continue
+            hexpart = line.split(":", 1)[1][:40]
+            try:
+                blob += bytes.fromhex(hexpart.replace(" ", ""))
+            except ValueError:
+                continue
+        return bytes(blob)
+
     def _reencode(self, src, start, end, dst, info, step_cb=None):
         duration = end - start
         # Single -ss before -i is frame-accurate when transcoding (ffmpeg ≥2.1,
@@ -887,16 +1050,156 @@ class SmartSave10Bit:
                 "-map", "0:v:0"]
         for a in range(info.nb_audio_streams):
             args.extend(["-map", f"0:a:{a}"])
-        args.extend(["-c:v", "libx265", "-profile:v", "main10",
-                     "-pix_fmt", "yuv420p10le", "-preset", self.preset,
-                     "-crf", str(self.crf)])
-        x265p = self._x265_params(info)
-        if x265p:
-            args.extend(["-x265-params", x265p])
+        # Encode in the source's own bit depth.  Smart-copy splices untouched
+        # source packets into the same track as the re-encoded spans, and
+        # Matroska carries only one parameter set per track — so encoding an
+        # 8-bit source to Main 10 would leave the copied 8-bit packets to be
+        # decoded against a 10-bit SPS/PPS (frozen picture, working audio).
+        profile, pix_fmt = info.encode_profile
+        encoder = self._pick_encoder(info)
+        args.extend(["-c:v", encoder, "-profile:v", profile,
+                     "-pix_fmt", pix_fmt])
+        if encoder == "libx265":
+            args.extend(["-preset", self.preset, "-crf", str(self.crf)])
+            x265p = self._x265_params(info)
+            if x265p:
+                args.extend(["-x265-params", x265p])
+        else:
+            args.extend(self._hw_encoder_args(encoder, info))
         args.extend(["-c:a", "copy",
                      "-map_metadata", "0", "-map_chapters", "-1",
                      "-f", "matroska", dst])
         self.ff.run(args, step_cb=step_cb)
+
+    # Hardware encoders whose bitstream matches a source produced by the same
+    # silicon.  Keyed by the vendor substring ffmpeg reports for the decoder's
+    # SPS, but selection is empirical (see _pick_encoder) rather than by name.
+    _HW_ENCODERS = ("hevc_nvenc", "hevc_qsv", "hevc_amf", "hevc_vaapi")
+
+    def _hw_encoder_args(self, encoder, info):
+        """Quality/rate-control args for a hardware HEVC encoder."""
+        # Map the CRF the user picked onto each encoder's own quality scale.
+        # These are all "constant quality" modes, so the number means roughly
+        # the same thing as CRF does for x265.
+        q = str(self.crf)
+        if encoder == "hevc_nvenc":
+            # p5 balances speed against quality; -cq is NVENC's CRF analogue.
+            # Match the source's B-frame count so the re-encoded span slots
+            # into the copied stream's reference structure.
+            args = ["-preset", "p5", "-rc", "vbr", "-cq", q, "-b:v", "0"]
+            if info.has_bframes:
+                args.extend(["-bf", str(info.has_bframes)])
+            return args
+        if encoder == "hevc_qsv":
+            return ["-global_quality", q, "-look_ahead", "0"]
+        if encoder == "hevc_amf":
+            return ["-rc", "cqp", "-qp_i", q, "-qp_p", q]
+        if encoder == "hevc_vaapi":
+            return ["-rc_mode", "CQP", "-qp", q]
+        return []
+
+    def _pick_encoder(self, info):
+        """Choose an encoder whose bitstream the copied source packets survive.
+
+        A stream-copied span keeps the source encoder's SPS/PPS while a
+        re-encoded one carries ours, and Matroska stores a single parameter
+        set per track -- so the concat step keeps one and the other encoder's
+        packets decode against the wrong SPS.  In practice that renders as a
+        frozen first frame with working audio.
+
+        Rather than guess from container tags (which are usually absent or
+        lie), encode a fraction of a second with each available encoder and
+        keep the one whose parameter sets are closest to the source's.  The
+        result is cached per save.
+        """
+        if self._encoder is not None:
+            return self._encoder
+        self._encoder = "libx265"   # conservative default if probing fails
+        src_nals = self._hvcc_param_nals(self._extradata(info.filepath))
+        if not src_nals:
+            log.info("Could not read source parameter sets; using libx265.")
+            return self._encoder
+        # Always attempt every encoder.  `-encoders` listing it proves nothing
+        # (the hardware may be absent) and omitting it proves nothing either
+        # (a custom build can still have it), so the probe encode is the only
+        # authority on whether an encoder actually works here.
+        best, best_score = None, -1.0
+        for enc in ("libx265",) + self._HW_ENCODERS:
+            score = self._encoder_match_score(enc, info, src_nals)
+            if score is None:
+                log.debug("Encoder %s did not produce a usable probe.", enc)
+                continue
+            log.debug("Encoder %s parameter-set match: %.2f", enc, score)
+            if score > best_score:
+                best, best_score = enc, score
+        if best:
+            self._encoder = best
+            log.info("Re-encoding with %s (parameter-set match %.0f%% vs the "
+                     "source's; keeps stream copy usable).", best, best_score * 100)
+        else:
+            # Every probe failed (no usable hardware, unreadable source).  The
+            # CPU encoder is always present, so fall back to it rather than
+            # failing the save.
+            log.warning("No encoder could be probed; falling back to %s.",
+                        self._encoder)
+        return self._encoder
+
+    def _encoder_match_score(self, encoder, info, src_nals):
+        """Encode a probe clip and score its VPS/SPS/PPS against the source's.
+
+        Returns a 0..1 similarity, or None if this encoder cannot run here.
+        """
+        probe = os.path.join(self._temp_dir, f"probe_{encoder}.mkv")
+        profile, pix_fmt = info.encode_profile
+        start = self._keyframes[0] if self._keyframes else info.start_time
+        # Probing an encoder the machine lacks is expected and routine, so
+        # keep ffmpeg quiet about it -- the return value reports the outcome.
+        args = ["-hide_banner", "-y", "-loglevel", "quiet",
+                "-ss", f"{start:.6f}", "-i", info.filepath,
+                "-t", "0.2", "-map", "0:v:0",
+                "-c:v", encoder, "-profile:v", profile, "-pix_fmt", pix_fmt]
+        if encoder == "libx265":
+            args.extend(["-preset", "ultrafast", "-crf", str(self.crf),
+                         "-x265-params", "repeat-headers=1"])
+        else:
+            args.extend(self._hw_encoder_args(encoder, info))
+        args.extend(["-f", "matroska", probe])
+        try:
+            self.ff.run(args)
+            enc_nals = self._hvcc_param_nals(self._extradata(probe))
+        except Exception as exc:
+            # A user cancellation surfaces here as a RuntimeError too; let it
+            # through instead of mistaking it for a missing encoder.
+            self._check_cancel()
+            log.debug("Encoder %s unavailable for this source: %s", encoder, exc)
+            return None
+        finally:
+            try:
+                if os.path.isfile(probe):
+                    os.remove(probe)
+            except OSError:
+                pass
+        if not enc_nals:
+            return None
+        # Score per NAL type: an exact payload match is what actually lets the
+        # copied packets decode, so weight that fully and give partial credit
+        # for a same-type NAL of similar length (VUI/timing differences only).
+        by_type = {}
+        for n in src_nals:
+            by_type.setdefault((n[0] >> 1) & 0x3F, []).append(n)
+        total = score = 0.0
+        for n in enc_nals:
+            t = (n[0] >> 1) & 0x3F
+            total += 1.0
+            cands = by_type.get(t)
+            if not cands:
+                continue
+            if any(n == c for c in cands):
+                score += 1.0
+            else:
+                closest = min(abs(len(n) - len(c)) for c in cands)
+                score += max(0.0, 1.0 - closest / 8.0) * 0.5
+        return score / total if total else None
 
     def _x265_params(self, info):
         params = ["repeat-headers=1", "aq-mode=3"]

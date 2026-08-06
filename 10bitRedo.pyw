@@ -515,6 +515,11 @@ class App(tk.Tk):
         if not output:
             messagebox.showerror("Error", "Please specify an output file path.")
             return
+        if os.path.normcase(os.path.abspath(output)) == os.path.normcase(os.path.abspath(source)):
+            messagebox.showerror("Error",
+                "Output file must be different from the source file —\n"
+                "writing over the file being read would destroy it.")
+            return
 
         segments = self._get_segments_from_ui()
         if not segments:
