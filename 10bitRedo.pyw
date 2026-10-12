@@ -21,8 +21,9 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from tenbitredo_engine import (
-    FFmpegHelper, VideoInfo, Segment, SmartSave10Bit,
+    FFmpegHelper, VideoInfo, Segment, SmartSave10Bit, JoinItem,
     VRDComBridge, VRDProjectParser, parse_manual_segments, cuts_to_kept,
+    group_by_join_profile, fmt_time,
 )
 
 log = logging.getLogger("tenbitredo")
@@ -71,6 +72,155 @@ class TextHandler(logging.Handler):
         self.widget.configure(state="disabled")
 
 # ---------------------------------------------------------------------------
+#  Modal dialogs
+# ---------------------------------------------------------------------------
+
+class _DarkDialog(tk.Toplevel):
+    """Modal dialog carrying the app's dark palette and title bar."""
+
+    def __init__(self, parent, title, width=560, height=320):
+        super().__init__(parent)
+        self.title(title)
+        self.configure(bg=_BG)
+        self.geometry(f"{width}x{height}")
+        self.transient(parent)
+        self.resizable(True, True)
+        self.result = None
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.after(20, self._dark_titlebar)
+
+    def _dark_titlebar(self):
+        try:
+            self.update_idletasks()
+            hwnd = ctypes.windll.user32.GetAncestor(self.winfo_id(), 2)
+            for attr in (20, 19):
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, attr, ctypes.byref(ctypes.c_int(1)),
+                    ctypes.sizeof(ctypes.c_int))
+        except Exception:
+            pass
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+    def show(self):
+        """Run the dialog modally and return its result."""
+        self.grab_set()
+        self.wait_window()
+        return self.result
+
+
+class InstanceSelectDialog(_DarkDialog):
+    """Pick one of several running VideoReDo instances."""
+
+    def __init__(self, parent, instances):
+        super().__init__(parent, "Select VideoReDo Instance", 620, 300)
+        self._instances = instances
+
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text=f"{len(instances)} running VideoReDo instances found. "
+                            "Choose one to attach to:").pack(anchor="w")
+
+        self._list = tk.Listbox(frm, bg=_ENT, fg=_FG, selectbackground=_SEL,
+                                selectforeground=_FG, relief="flat",
+                                borderwidth=1, font=("Segoe UI", 9),
+                                activestyle="none", exportselection=False)
+        self._list.pack(fill="both", expand=True, pady=(8, 8))
+        for inst in instances:
+            self._list.insert(tk.END, f"  {inst.label}")
+        self._list.selection_set(0)
+        self._list.bind("<Double-Button-1>", lambda _e: self._ok())
+
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Attach", style="Accent.TButton",
+                   command=self._ok).pack(side="right")
+        ttk.Button(btns, text="Cancel",
+                   command=self._cancel).pack(side="right", padx=(0, 6))
+
+    def _ok(self):
+        sel = self._list.curselection()
+        if sel:
+            self.result = self._instances[sel[0]]
+        self.destroy()
+
+
+class ProfileSelectDialog(_DarkDialog):
+    """Resolve a joiner-list format mismatch.
+
+    Shows each distinct stream profile and how many files carry it.  The
+    chosen profile is kept as-is (those files stay smart-copied); every file
+    outside it is re-encoded to conform.
+    """
+
+    def __init__(self, parent, groups):
+        super().__init__(parent, "Sources Do Not Match", 700, 420)
+        self._groups = groups
+
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="The files in the joiner list do not share the same "
+                            "video format, so they cannot all be stream-copied.",
+                  wraplength=660).pack(anchor="w")
+        ttk.Label(frm, text="Pick the format to keep. Files already in that "
+                            "format are joined losslessly; the rest are "
+                            "re-encoded to match.",
+                  wraplength=660, foreground="gray").pack(anchor="w", pady=(2, 8))
+
+        self._list = tk.Listbox(frm, bg=_ENT, fg=_FG, selectbackground=_SEL,
+                                selectforeground=_FG, relief="flat",
+                                borderwidth=1, font=("Consolas", 9),
+                                activestyle="none", exportselection=False)
+        self._list.pack(fill="both", expand=True)
+        total = sum(len(items) for _p, items in groups)
+        for _profile, items in groups:
+            desc = items[0].info.profile_desc
+            n = len(items)
+            n_reenc = total - n
+            self._list.insert(
+                tk.END,
+                f"  {desc}   —  keep {n} file(s), re-encode {n_reenc}")
+        self._list.selection_set(0)
+        self._list.bind("<Double-Button-1>", lambda _e: self._ok())
+
+        self._detail = tk.Text(frm, height=6, bg=_BG2, fg=_FG, relief="flat",
+                               borderwidth=1, font=("Consolas", 8),
+                               state="disabled", wrap="none")
+        self._detail.pack(fill="x", pady=(8, 8))
+        self._list.bind("<<ListboxSelect>>", lambda _e: self._show_detail())
+        self._show_detail()
+
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Use This Format", style="Accent.TButton",
+                   command=self._ok).pack(side="right")
+        ttk.Button(btns, text="Cancel",
+                   command=self._cancel).pack(side="right", padx=(0, 6))
+
+    def _show_detail(self):
+        sel = self._list.curselection()
+        if not sel:
+            return
+        keep_profile = self._groups[sel[0]][0]
+        self._detail.configure(state="normal")
+        self._detail.delete("1.0", tk.END)
+        for _profile, items in self._groups:
+            for it in items:
+                mark = "keep    " if it.info.join_profile == keep_profile else "re-encode"
+                self._detail.insert(
+                    tk.END, f"{mark}  {os.path.basename(it.path)}\n")
+        self._detail.configure(state="disabled")
+
+    def _ok(self):
+        sel = self._list.curselection()
+        if sel:
+            self.result = self._groups[sel[0]]
+        self.destroy()
+
+
+# ---------------------------------------------------------------------------
 #  Main application
 # ---------------------------------------------------------------------------
 
@@ -85,6 +235,9 @@ class App(tk.Tk):
         self._ff: FFmpegHelper = None
         self._source_file: str = ""
         self._segments: list = []
+        self._join_items: list = []     # JoinItem entries, in output order
+        self._join_mode = False
+        self._join_edit_idx = None      # joiner row the segment editor is bound to
         self._working = False
         self._poll_id = None
         self._last_seg_hash = ""
@@ -157,6 +310,17 @@ class App(tk.Tk):
             background=[('active', '#1177bb'), ('pressed', '#094771'),
                         ('disabled', '#3a3a3a')],
             foreground=[('disabled', '#777777')])
+        # Checkbutton — the indicator needs explicit colours under 'clam',
+        # which otherwise draws it near-white on the dark background.
+        style.configure('Dark.TCheckbutton',
+            background=_BG, foreground=_FG,
+            indicatorcolor=_ENT, bordercolor=_BOR,
+            focuscolor=_BG, padding=2)
+        style.map('Dark.TCheckbutton',
+            background=[('active', _BG)],
+            foreground=[('disabled', '#777777')],
+            indicatorcolor=[('selected', _SEL), ('pressed', _SEL),
+                            ('disabled', '#3a3a3a')])
         # Cancel style — red background
         style.configure('Cancel.TButton',
             background='#8b1a1a', foreground='#ffffff',
@@ -201,8 +365,10 @@ class App(tk.Tk):
 
         row2 = ttk.Frame(src_frame)
         row2.pack(fill="x", pady=(4, 0))
-        ttk.Button(row2, text="Connect to VideoReDo (COM)",
-                   command=self._connect_vrd).pack(side="left")
+        ttk.Button(row2, text="Attach to Running VideoReDo",
+                   command=self._attach_vrd).pack(side="left")
+        ttk.Button(row2, text="Open New VideoReDo",
+                   command=self._connect_vrd).pack(side="left", padx=(8, 0))
         ttk.Button(row2, text="Load .VPrj Project",
                    command=self._load_project).pack(side="left", padx=(8, 0))
 
@@ -239,6 +405,50 @@ class App(tk.Tk):
                                              textvariable=self._auto_update_var,
                                              foreground="#4ec9b0")
         self._auto_update_label.pack(side="right")
+
+        # ---- Joiner list ----
+        join_frame = ttk.LabelFrame(main, text="Joiner List", padding=6)
+        join_frame.pack(fill="x", **pad)
+
+        jtop = ttk.Frame(join_frame)
+        jtop.pack(fill="x")
+        self._join_enable_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(jtop, text="Join multiple files into one output",
+                        variable=self._join_enable_var,
+                        command=self._toggle_join_mode,
+                        style="Dark.TCheckbutton").pack(side="left")
+        self._join_info_var = tk.StringVar(value="")
+        ttk.Label(jtop, textvariable=self._join_info_var,
+                  foreground="gray").pack(side="right")
+
+        jbody = ttk.Frame(join_frame)
+        jbody.pack(fill="x", pady=(4, 0))
+
+        self._join_list = tk.Listbox(jbody, height=5, bg=_ENT, fg=_FG,
+                                     selectbackground=_SEL, selectforeground=_FG,
+                                     relief="flat", borderwidth=1,
+                                     font=("Consolas", 9), activestyle="none",
+                                     exportselection=False)
+        self._join_list.pack(side="left", fill="both", expand=True)
+        jscroll = ttk.Scrollbar(jbody, orient="vertical",
+                                command=self._join_list.yview)
+        jscroll.pack(side="left", fill="y")
+        self._join_list.configure(yscrollcommand=jscroll.set)
+        self._join_list.bind("<<ListboxSelect>>", self._on_join_select)
+
+        jbtns = ttk.Frame(jbody)
+        jbtns.pack(side="left", fill="y", padx=(6, 0))
+        for text, cmd in (("Add…",      self._join_add),
+                          ("Add current", self._join_add_current),
+                          ("Remove",    self._join_remove),
+                          ("▲",         lambda: self._join_move(-1)),
+                          ("▼",         lambda: self._join_move(1)),
+                          ("Clear",     self._join_clear)):
+            ttk.Button(jbtns, text=text, width=12,
+                       command=cmd).pack(fill="x", pady=1)
+
+        self._join_widgets = [self._join_list, jscroll, jbtns]
+        self._set_join_enabled(False)
 
         # ---- Output section ----
         out_frame = ttk.LabelFrame(main, text="Output", padding=6)
@@ -354,12 +564,7 @@ class App(tk.Tk):
             return
         try:
             info = self._ff.probe(self._source_file)
-            desc = (f"{info.width}x{info.height}  {info.codec_name}  "
-                    f"{info.pix_fmt}  {info.bit_depth}-bit  "
-                    f"{info.fps:.3f}fps  {info.duration:.1f}s")
-            if info.is_hdr:
-                desc += "  HDR"
-            self._src_info_var.set(desc)
+            self._src_info_var.set(self._describe(info))
             if not info.is_10bit:
                 log.warning("Source is NOT 10-bit (%s, %d-bit). "
                             "Output will still use 10-bit encoding for boundaries.",
@@ -380,17 +585,7 @@ class App(tk.Tk):
                     log.info("Connected to VideoReDo (version %s)", ver)
                 except Exception:
                     log.info("Connected to VideoReDo COM object.")
-                # Try to get source file
-                src = self._vrd.get_source_file()
-                if src:
-                    self._src_var.set(src)
-                    self._source_file = src
-                    self._probe_source()
-                    log.info("Source file: %s", src)
-                else:
-                    log.info("Connected. Browse to source file manually.")
-                # Start auto-polling segments
-                self._start_segment_poll()
+                self._after_vrd_connected()
             else:
                 messagebox.showwarning("Connection failed",
                     "Could not connect to VideoReDo via COM.\n"
@@ -403,6 +598,65 @@ class App(tk.Tk):
                 "Install it:  pip install pywin32")
         except Exception as e:
             messagebox.showerror("Error", f"COM error: {e}")
+
+    def _attach_vrd(self):
+        """Attach to an already-running VideoReDo rather than starting one."""
+        try:
+            instances = VRDComBridge.list_running()
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not look for running instances:\n{e}")
+            return
+
+        bridge = VRDComBridge()
+        chosen = None
+        if len(instances) > 1:
+            chosen = InstanceSelectDialog(self, instances).show()
+            if chosen is None:
+                log.info("Attach cancelled.")
+                return
+            ok = bridge.attach(chosen)
+        elif len(instances) == 1:
+            chosen = instances[0]
+            ok = bridge.attach(chosen)
+        else:
+            # The ROT walk can come up empty even with VideoReDo on screen if
+            # the build registers under a moniker we do not match, so fall
+            # back to the single active object before giving up.
+            ok = bridge.attach_active()
+            if not ok:
+                messagebox.showwarning(
+                    "No running instance",
+                    "No running VideoReDo instance was found.\n\n"
+                    "Start VideoReDo and open your video, or use "
+                    "'Open New VideoReDo' to launch one.")
+                return
+
+        if not ok:
+            messagebox.showerror("Attach failed",
+                "Found a VideoReDo instance but could not attach to it.")
+            return
+
+        self._vrd = bridge
+        try:
+            log.info("Attached to running VideoReDo (version %s)",
+                     self._vrd.get_version())
+        except Exception:
+            log.info("Attached to running VideoReDo.")
+        if chosen is not None and chosen.opened_file:
+            log.info("Instance has open file: %s", chosen.opened_file)
+        self._after_vrd_connected()
+
+    def _after_vrd_connected(self):
+        """Shared post-connect work for attach and launch."""
+        src = self._vrd.get_source_file()
+        if src:
+            self._src_var.set(src)
+            self._source_file = src
+            self._probe_source()
+            log.info("Source file: %s", src)
+        else:
+            log.info("Connected. Browse to source file manually.")
+        self._start_segment_poll()
 
     def _load_project(self):
         p = filedialog.askopenfilename(
@@ -448,6 +702,163 @@ class App(tk.Tk):
         s = secs % 60
         return f"{h}:{m:02d}:{s:06.3f}"
 
+    # -- Joiner list -------------------------------------------------------
+
+    def _set_join_enabled(self, on: bool):
+        state = "normal" if on else "disabled"
+        self._join_list.configure(state=state)
+        for child in self._join_widgets[2].winfo_children():
+            child.configure(state=state)
+
+    def _toggle_join_mode(self):
+        self._join_mode = bool(self._join_enable_var.get())
+        self._set_join_enabled(self._join_mode)
+        if self._join_mode:
+            self._save_btn.configure(text="▶  Save Joined 10-bit HEVC")
+            log.info("Joiner mode on — the list below is saved in order. "
+                     "Select an entry to edit its segments.")
+        else:
+            # Flush pending edits, then unbind the editor so it goes back to
+            # tracking the single source file (and VRD polling resumes).
+            self._commit_join_edit()
+            self._join_edit_idx = None
+            self._save_btn.configure(text="▶  Save 10-bit HEVC")
+        self._refresh_join_list()
+
+    def _join_probe(self, path):
+        """Probe a file for the joiner list, reporting failure to the log."""
+        if not self._ensure_ffmpeg():
+            return None
+        try:
+            return self._ff.probe(path)
+        except Exception as e:
+            log.error("Could not probe %s: %s", os.path.basename(path), e)
+            return None
+
+    def _join_add(self):
+        paths = filedialog.askopenfilenames(
+            title="Add videos to joiner list",
+            filetypes=[
+                ("Video files", "*.ts *.mkv *.mp4 *.m2ts *.mpg *.mpeg *.avi *.mov *.wmv *.vob"),
+                ("All files", "*.*"),
+            ])
+        added = 0
+        for p in paths:
+            info = self._join_probe(p)
+            if info is None:
+                continue
+            self._join_items.append(JoinItem(path=p, segments=[], info=info))
+            added += 1
+        if added:
+            log.info("Added %d file(s) to the joiner list.", added)
+        self._refresh_join_list()
+
+    def _join_add_current(self):
+        """Add the current source file, carrying over its edited segments."""
+        src = self._src_var.get().strip()
+        if not src or not os.path.isfile(src):
+            messagebox.showerror("Error", "No valid source file is loaded.")
+            return
+        info = self._join_probe(src)
+        if info is None:
+            messagebox.showerror("Error", f"Could not read {os.path.basename(src)}.")
+            return
+        segs = self._get_segments_from_ui()
+        self._join_items.append(JoinItem(path=src, segments=segs, info=info))
+        log.info("Added %s to the joiner list (%d segment(s)).",
+                 os.path.basename(src), len(segs))
+        self._refresh_join_list()
+
+    def _join_remove(self):
+        sel = list(self._join_list.curselection())
+        for i in reversed(sel):
+            if 0 <= i < len(self._join_items):
+                self._join_items.pop(i)
+        self._refresh_join_list()
+
+    def _join_move(self, delta):
+        sel = self._join_list.curselection()
+        if not sel:
+            return
+        i = sel[0]
+        j = i + delta
+        if not (0 <= j < len(self._join_items)):
+            return
+        self._join_items[i], self._join_items[j] = \
+            self._join_items[j], self._join_items[i]
+        self._refresh_join_list()
+        self._join_list.selection_set(j)
+
+    def _join_clear(self):
+        self._join_items.clear()
+        self._refresh_join_list()
+
+    def _on_join_select(self, _event=None):
+        """Load the selected item's segments into the segment editor."""
+        sel = self._join_list.curselection()
+        if not sel or self._working:
+            return
+        # Commit whatever is in the editor back to the previously selected
+        # item first, so switching entries does not silently discard edits.
+        if self._join_edit_idx is not None and \
+                0 <= self._join_edit_idx < len(self._join_items) and \
+                self._join_edit_idx != sel[0]:
+            self._join_items[self._join_edit_idx].segments = \
+                self._get_segments_from_ui()
+        i = sel[0]
+        self._join_edit_idx = i
+        item = self._join_items[i]
+        self._src_var.set(item.path)
+        self._source_file = item.path
+        if item.info:
+            self._src_info_var.set(self._describe(item.info))
+        self._set_segments(item.segments)
+        if not item.segments:
+            self._seg_text.insert("1.0",
+                "# No segments — the whole file is kept.\n"
+                "# Add lines here to trim this entry.\n")
+
+    def _commit_join_edit(self):
+        """Flush the segment editor into the item it belongs to."""
+        if self._join_edit_idx is not None and \
+                0 <= self._join_edit_idx < len(self._join_items):
+            self._join_items[self._join_edit_idx].segments = \
+                self._get_segments_from_ui()
+
+    def _refresh_join_list(self):
+        prev = self._join_list.curselection()
+        self._join_list.configure(state="normal")
+        self._join_list.delete(0, tk.END)
+        total = 0.0
+        for n, it in enumerate(self._join_items, 1):
+            if it.segments:
+                dur = sum(s.duration for s in it.segments)
+                segdesc = f"{len(it.segments)} seg"
+            else:
+                dur = it.info.duration if it.info else 0.0
+                segdesc = "full"
+            total += dur
+            self._join_list.insert(
+                tk.END,
+                f"{n:2d}. {os.path.basename(it.path)[:44]:<44} "
+                f"{segdesc:>7}  {fmt_time(dur)}")
+        if not self._join_mode:
+            self._join_list.configure(state="disabled")
+        if prev and prev[0] < len(self._join_items):
+            self._join_list.selection_set(prev[0])
+        if self._join_items:
+            self._join_info_var.set(
+                f"{len(self._join_items)} file(s) · {fmt_time(total)} total")
+        else:
+            self._join_info_var.set("")
+
+    @staticmethod
+    def _describe(info) -> str:
+        desc = (f"{info.width}x{info.height}  {info.codec_name}  "
+                f"{info.pix_fmt}  {info.bit_depth}-bit  "
+                f"{info.fps:.3f}fps  {info.duration:.1f}s")
+        return desc + "  HDR" if info.is_hdr else desc
+
     # -- Auto-update segments from VRD COM ---------------------------------
 
     def _start_segment_poll(self):
@@ -463,7 +874,10 @@ class App(tk.Tk):
         self._auto_update_label.configure(foreground="#f14c4c")
 
     def _poll_vrd_segments(self):
-        if self._working:
+        # Pause while saving, and while the segment editor is bound to a
+        # joiner row — otherwise VRD's live edit list would overwrite the
+        # segments the user is entering for that entry.
+        if self._working or (self._join_mode and self._join_edit_idx is not None):
             self._poll_id = self.after(2000, self._poll_vrd_segments)
             return
         try:
@@ -504,6 +918,9 @@ class App(tk.Tk):
 
     def _do_save(self):
         if self._working:
+            return
+        if self._join_mode:
+            self._do_save_joined()
             return
 
         source = self._src_var.get().strip()
@@ -547,6 +964,115 @@ class App(tk.Tk):
         t = threading.Thread(target=self._save_worker,
                              args=(source, segments, output), daemon=True)
         t.start()
+
+    def _do_save_joined(self):
+        """Validate the joiner list, resolve format mismatches, then save."""
+        self._commit_join_edit()
+        output = self._out_var.get().strip()
+
+        if len(self._join_items) < 2:
+            messagebox.showerror("Error",
+                "Add at least two files to the joiner list, "
+                "or turn joiner mode off.")
+            return
+        if not output:
+            messagebox.showerror("Error", "Please specify an output file path.")
+            return
+
+        missing = [it.path for it in self._join_items if not os.path.isfile(it.path)]
+        if missing:
+            messagebox.showerror("Error",
+                "These joiner entries no longer exist:\n\n" +
+                "\n".join(os.path.basename(m) for m in missing))
+            return
+
+        out_norm = os.path.normcase(os.path.abspath(output))
+        for it in self._join_items:
+            if os.path.normcase(os.path.abspath(it.path)) == out_norm:
+                messagebox.showerror("Error",
+                    "The output file is also in the joiner list —\n"
+                    "writing over a file being read would destroy it.")
+                return
+
+        if not self._ensure_ffmpeg():
+            return
+
+        # Re-probe anything missing an info record (e.g. a file added before
+        # ffmpeg was located).
+        for it in self._join_items:
+            if it.info is None:
+                it.info = self._join_probe(it.path)
+        if any(it.info is None for it in self._join_items):
+            messagebox.showerror("Error",
+                "Some joiner entries could not be probed. See the log.")
+            return
+
+        # Resolve format mismatches: the user picks which profile is kept,
+        # and every file outside it is flagged for a conforming re-encode.
+        groups = group_by_join_profile(self._join_items)
+        target_info = self._join_items[0].info
+        for it in self._join_items:
+            it.conform = False
+        if len(groups) > 1:
+            chosen = ProfileSelectDialog(self, groups).show()
+            if chosen is None:
+                log.info("Join cancelled at the format prompt.")
+                return
+            keep_profile, keep_items = chosen
+            target_info = keep_items[0].info
+            n_conform = 0
+            for it in self._join_items:
+                it.conform = it.info.join_profile != keep_profile
+                n_conform += it.conform
+            log.warning("Joiner sources differ: keeping %s, re-encoding %d file(s).",
+                        target_info.profile_desc, n_conform)
+            for it in self._join_items:
+                if it.conform:
+                    log.warning("  re-encode: %s (%s)",
+                                os.path.basename(it.path), it.info.profile_desc)
+
+        if os.path.isfile(output):
+            if not messagebox.askyesno("Overwrite?",
+                    f"Output file already exists:\n{output}\n\nOverwrite?"):
+                return
+
+        items = list(self._join_items)
+        self._working = True
+        self._progress_target = 0.0
+        self._cancel_event = threading.Event()
+        self._ff.set_cancel_event(self._cancel_event)
+        self._save_btn.configure(text="■  Cancel", command=self._do_cancel,
+                                 style="Cancel.TButton")
+        self._progress_var.set(0)
+        self._pct_var.set("0%")
+
+        t = threading.Thread(target=self._join_worker,
+                             args=(items, output, target_info), daemon=True)
+        t.start()
+
+    def _join_worker(self, items: list, output: str, target_info):
+        try:
+            self._engine = SmartSave10Bit(self._ff,
+                                          crf=self._crf_var.get(),
+                                          preset=self._preset_var.get())
+            self._engine.set_progress_callback(self._on_progress)
+            self._engine.save_joined(items, output, target_info=target_info)
+            self.after(0, lambda: messagebox.showinfo("Complete",
+                f"Joined 10-bit HEVC output saved:\n{output}"))
+        except RuntimeError as e:
+            if str(e) == "Cancelled":
+                log.info("Join cancelled by user.")
+            else:
+                log.error("Join failed: %s", e)
+                self.after(0, lambda msg=str(e): messagebox.showerror("Error",
+                    f"Join failed:\n{msg}"))
+        except Exception as e:
+            log.error("Join failed: %s", e)
+            self.after(0, lambda msg=str(e): messagebox.showerror("Error",
+                f"Join failed:\n{msg}"))
+        finally:
+            self._engine = None
+            self.after(0, self._save_done)
 
     def _save_worker(self, source: str, segments: list, output: str):
         try:
@@ -608,10 +1134,14 @@ class App(tk.Tk):
             self._ff.set_cancel_event(None)
             self._cancel_event = None
         self._save_btn.configure(
-            text="\u25b6  Save 10-bit HEVC", command=self._do_save,
+            text="\u25b6  Save Joined 10-bit HEVC" if self._join_mode
+                 else "\u25b6  Save 10-bit HEVC",
+            command=self._do_save,
             style="Accent.TButton", state="normal")
         self._progress_var.set(0)
         self._pct_var.set("")
+        if self._join_mode:
+            self._refresh_join_list()
 
 
 # ---------------------------------------------------------------------------

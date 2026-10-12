@@ -101,6 +101,26 @@ class VideoInfo:
     def is_hdr(self) -> bool:
         return self.color_transfer in ("smpte2084", "arib-std-b67") or bool(self.master_display)
 
+    @property
+    def join_profile(self) -> tuple:
+        """The properties that must match for two files to be concatenated
+        with stream copy.
+
+        Matroska stores one parameter set per track, so joined sources have to
+        agree on codec, geometry, pixel format and frame rate; anything else
+        decodes against the wrong SPS/PPS.  Frame rate is rounded because
+        29.97 is reported as both 30000/1001 and 2997/100 by different
+        demuxers.
+        """
+        return (self.codec_name, self.width, self.height,
+                self.pix_fmt, round(self.fps, 2))
+
+    @property
+    def profile_desc(self) -> str:
+        """Human-readable form of join_profile, for the mismatch dialog."""
+        return (f"{self.width}x{self.height}  {self.codec_name}  "
+                f"{self.pix_fmt}  {self.fps:.3f}fps")
+
 
 @dataclass
 class Segment:
@@ -113,6 +133,31 @@ class Segment:
 
     def __repr__(self):
         return f"Segment({self.start:.3f}s - {self.end:.3f}s)"
+
+
+@dataclass
+class JoinItem:
+    """One entry in the joiner list: a source file plus the parts to keep.
+
+    `segments` empty means "keep the whole file".  `info` is filled in by the
+    caller (the GUI probes on add) so the compatibility check can run without
+    re-probing.
+    """
+    path: str
+    segments: List[Segment] = None
+    info: Optional[VideoInfo] = None
+    conform: bool = False   # set by the mismatch resolver: full re-encode
+
+    def __post_init__(self):
+        if self.segments is None:
+            self.segments = []
+
+    def effective_segments(self) -> List[Segment]:
+        """Kept segments, defaulting to the whole file when none are set."""
+        if self.segments:
+            return self.segments
+        dur = self.info.duration if self.info else 0.0
+        return [Segment(start=0.0, end=dur)]
 
 
 class FFmpegHelper:
@@ -333,8 +378,27 @@ class FFmpegHelper:
             return r
 
 
+@dataclass
+class VRDInstance:
+    """One VideoReDo instance found in the COM Running Object Table."""
+    index: int
+    display_name: str
+    opened_file: str = ""
+    _obj: object = None
+
+    @property
+    def label(self):
+        if self.opened_file:
+            return f"{os.path.basename(self.opened_file)}  —  {self.display_name}"
+        return f"(no file open)  —  {self.display_name}"
+
+
 class VRDComBridge:
     """COM bridge -- property names from TLB dump of VideoReDo.tlb."""
+
+    # ROT display names for a registered VideoReDo instance vary by build, so
+    # match on the product name rather than an exact moniker string.
+    _ROT_MATCH = ("videoredo",)
 
     def __init__(self):
         self._vrd = None
@@ -361,6 +425,132 @@ class VRDComBridge:
         except Exception as exc:
             log.error("Failed to connect to VideoReDo: %s", exc)
             return False
+
+    # -- Attaching to an already-running instance ---------------------------
+
+    @classmethod
+    def list_running(cls):
+        """Enumerate live VideoReDo instances from the Running Object Table.
+
+        Dispatch() is not an attach: it hands back the single ROT-registered
+        instance if there is one and silently launches a new process if there
+        is not.  Walking the ROT is the only way to see *every* running
+        instance and let the user pick among them.
+
+        Returns a list of VRDInstance (possibly empty).  Never raises.
+        """
+        try:
+            import pythoncom
+            import win32com.client
+        except ImportError:
+            log.error("pywin32 is required to attach to a running VideoReDo.")
+            return []
+
+        found = []
+        try:
+            rot = pythoncom.GetRunningObjectTable()
+            ctx = pythoncom.CreateBindCtx(0)
+            for moniker in cls._enum_rot(rot):
+                try:
+                    name = moniker.GetDisplayName(ctx, None)
+                except Exception:
+                    continue
+                if not any(m in name.lower() for m in cls._ROT_MATCH):
+                    continue
+                try:
+                    unk = rot.GetObject(moniker)
+                    obj = win32com.client.Dispatch(
+                        unk.QueryInterface(pythoncom.IID_IDispatch))
+                except Exception:
+                    continue
+                obj = cls._unwrap(obj)
+                if obj is None:
+                    continue
+                inst = VRDInstance(index=len(found), display_name=name, _obj=obj)
+                try:
+                    fname = str(obj.FileGetOpenedFileName or "")
+                    inst.opened_file = fname if os.path.isfile(fname) else ""
+                except Exception:
+                    pass
+                found.append(inst)
+        except Exception as exc:
+            log.error("Could not enumerate running instances: %s", exc)
+            return []
+        return found
+
+    @staticmethod
+    def _enum_rot(rot):
+        """Yield every moniker in the Running Object Table.
+
+        EnumRunning() is the documented enumerator; PyIRunningObjectTable also
+        supports the iterator protocol, but only the former is guaranteed
+        across pywin32 versions, so fall back rather than depend on it.
+        """
+        try:
+            enum = rot.EnumRunning()
+        except Exception:
+            yield from rot
+            return
+        while True:
+            try:
+                batch = enum.Next(1)
+            except Exception:
+                return
+            if not batch:
+                return
+            for moniker in batch:
+                yield moniker
+
+    @staticmethod
+    def _unwrap(obj):
+        """Return the IVideoReDo interface from a ROT object, or None.
+
+        The ROT may hold either the automation interface itself or the
+        VideoReDoSilent wrapper that exposes it as .VRDInterface.
+        """
+        for candidate in (obj, getattr(obj, "VRDInterface", None)):
+            if candidate is None:
+                continue
+            try:
+                # Touching a known property is the only reliable way to tell
+                # a real IVideoReDo from an unrelated object with the same
+                # name in its moniker.
+                _ = candidate.ProgramGetVersionNumber
+                return candidate
+            except Exception:
+                continue
+        return None
+
+    def attach(self, instance):
+        """Bind this bridge to a VRDInstance returned by list_running()."""
+        if instance is None or instance._obj is None:
+            return False
+        self._vrd = instance._obj
+        try:
+            _ = self._vrd.ProgramGetVersionNumber
+        except Exception as exc:
+            log.error("Attached object is not responding: %s", exc)
+            self._vrd = None
+            return False
+        return True
+
+    def attach_active(self):
+        """Attach to the single ROT-registered instance without launching one.
+
+        Unlike connect(), this fails instead of starting VideoReDo when
+        nothing is running.
+        """
+        try:
+            import win32com.client
+            obj = win32com.client.GetActiveObject("VideoReDo6.Application")
+        except Exception as exc:
+            log.debug("No active VideoReDo instance: %s", exc)
+            return False
+        obj = self._unwrap(obj)
+        if obj is None:
+            return False
+        self._vrd = obj
+        return True
 
     @property
     def connected(self):
@@ -553,6 +743,21 @@ def parse_manual_segments(text):
     return segments
 
 
+def group_by_join_profile(items):
+    """Bucket joiner items by stream compatibility.
+
+    Returns a list of (profile_tuple, [JoinItem, ...]) ordered by descending
+    group size, so the caller can offer the largest compatible group as the
+    default target — that re-encodes the fewest files.
+    """
+    groups = {}
+    for it in items:
+        if it.info is None:
+            continue
+        groups.setdefault(it.info.join_profile, []).append(it)
+    return sorted(groups.items(), key=lambda kv: -len(kv[1]))
+
+
 def fmt_time(secs):
     h = int(secs // 3600)
     m = int((secs % 3600) // 60)
@@ -623,6 +828,186 @@ class SmartSave10Bit:
         finally:
             if self._temp_dir and os.path.isdir(self._temp_dir):
                 shutil.rmtree(self._temp_dir, ignore_errors=True)
+
+    def save_joined(self, items, output_file, target_info=None):
+        """Smart-edit each joiner item, then concatenate them into one file.
+
+        *items* is a list of JoinItem.  Items whose `conform` flag is set are
+        fully re-encoded to *target_info*'s geometry and pixel format instead
+        of being smart-edited, because their packets could not be spliced into
+        the target's track.  Everything else keeps the normal copy/re-encode
+        split.
+        """
+        if not items:
+            raise RuntimeError("Joiner list is empty.")
+        self._temp_dir = tempfile.mkdtemp(prefix="vrd10bit_")
+        try:
+            self._save_joined_impl(items, output_file, target_info)
+        finally:
+            if self._temp_dir and os.path.isdir(self._temp_dir):
+                shutil.rmtree(self._temp_dir, ignore_errors=True)
+
+    def _save_joined_impl(self, items, output_file, target_info):
+        self._report(0, f"Joining {len(items)} file(s)...")
+        for it in items:
+            if it.info is None:
+                it.info = self.ff.probe(it.path)
+        if target_info is None:
+            target_info = items[0].info
+
+        # Weight every item by its kept duration so one progress bar spans the
+        # whole join rather than restarting per file.
+        per_item_dur = [sum(s.duration for s in it.effective_segments())
+                        for it in items]
+        total_out_dur = max(sum(per_item_dur), 0.001)
+        self._total_weight = total_out_dur * 2   # produce + concat passes
+        self._completed_weight = 0.0
+
+        all_parts = []
+        for i, it in enumerate(items):
+            self._check_cancel()
+            name = os.path.basename(it.path)
+            base_pct = 10.0 + 90.0 * self._completed_weight / self._total_weight
+            self._report(base_pct, f"[{i+1}/{len(items)}] {name}")
+            # Encoder choice is per source: it must match the packets *that
+            # file* contributes, not the previous file's.
+            self._encoder = None
+            if it.conform:
+                parts = self._conform_item(it, target_info, i)
+            else:
+                parts = self._smart_item(it, i)
+            if not parts:
+                log.warning("%s produced no output parts; skipping.", name)
+            all_parts.extend(parts)
+
+        if not all_parts:
+            raise RuntimeError("No output segments were produced.")
+
+        self._check_cancel()
+        concat_cb = self._begin_step(total_out_dur)
+        self._report(self._step_base_pct, "Concatenating joined output...")
+        # Chapters are dropped for joins: the source chapter timelines belong
+        # to different files and remapping them across a join would need a
+        # per-file offset the concat demuxer does not expose.
+        self._concat([p for p, _, _ in all_parts], output_file,
+                     durations=[d for _, d, _ in all_parts],
+                     inpoints=[ip for _, _, ip in all_parts],
+                     source_file=items[0].path,
+                     chapters_file=None,
+                     step_cb=concat_cb)
+        self._finish_step(total_out_dur)
+
+        size_mb = os.path.getsize(output_file) / (1024 * 1024)
+        self._report(100, f"Done! {output_file} ({size_mb:.1f} MB)")
+
+    def _smart_item(self, item, idx):
+        """Smart copy/re-encode one joiner item; returns concat part tuples."""
+        info = item.info
+        segments = item.effective_segments()
+        boundary_times = sorted({t for s in segments for t in (s.start, s.end)})
+        if not boundary_times:
+            boundary_times = [0.0]
+        keyframes = self.ff.get_keyframes_near(
+            item.path, boundary_times, window=30.0, start_time=info.start_time)
+        self._keyframes = keyframes
+        self._check_cancel()
+        if keyframes:
+            self._pick_encoder(info)
+            self._check_cancel()
+        plans = self._plan_all(segments, keyframes)
+        self._log_plans(plans)
+        parts = []
+        name = os.path.basename(item.path)
+        for j, plan in enumerate(plans):
+            self._check_cancel()
+            # Namespace the temp files by joiner index so two items with the
+            # same segment count cannot overwrite each other's parts.
+            parts.extend(self._process_one(
+                item.path, info, plan, f"{idx}_{j}",
+                label=f"{name} seg {j + 1}"))
+        return parts
+
+    def _conform_item(self, item, target_info, idx):
+        """Fully re-encode one item to the target profile, one part per segment.
+
+        Used when the item's stream is not compatible with the files it is
+        being joined to, so no packet of it can be copied.
+        """
+        info = item.info
+        log.info("Conforming %s (%s) to %s",
+                 os.path.basename(item.path), info.profile_desc,
+                 target_info.profile_desc)
+        parts = []
+        frame_dur = 1.0 / (target_info.fps or info.fps or 24.0)
+        for j, seg in enumerate(item.effective_segments()):
+            self._check_cancel()
+            step_cb = self._begin_step(seg.duration)
+            self._report(self._step_base_pct,
+                         f"Re-encoding {os.path.basename(item.path)} "
+                         f"{fmt_time(seg.start)} - {fmt_time(seg.end)}")
+            out = os.path.join(self._temp_dir, f"join{idx}_{j}_conform.mkv")
+            self._reencode_conform(item.path, seg.start, seg.end, out,
+                                   info, target_info, step_cb=step_cb)
+            self._finish_step(seg.duration)
+            if os.path.isfile(out) and os.path.getsize(out) > 0:
+                first_pts, last_pts = self._get_pts_range(out)
+                if first_pts is None:
+                    log.warning("Conformed part %s_%s has no video packets", idx, j)
+                    continue
+                parts.append((out, last_pts - first_pts + frame_dur, first_pts))
+            else:
+                log.warning("Conformed part %s_%s is empty", idx, j)
+        return parts
+
+    def _reencode_conform(self, src, start, end, dst, info, target, step_cb=None):
+        """Re-encode a span, scaling/converting it to the target's format.
+
+        The conformed part must expose the same stream layout as the parts it
+        is concatenated with: the concat demuxer matches streams by index, so
+        a silent source in an otherwise-audible join needs a synthesized
+        silent track, or every later part's audio shifts up one index.
+        """
+        duration = end - start
+        args = ["-hide_banner", "-y", "-loglevel", "warning",
+                "-ss", f"{start:.6f}", "-i", src]
+        n_src_audio = info.nb_audio_streams
+        n_want_audio = max(target.nb_audio_streams, 0)
+        n_silent = max(n_want_audio - n_src_audio, 0)
+        for _ in range(n_silent):
+            # anullsrc is an infinite source, so it gets its own input-side -t.
+            # The output-side -t below bounds the muxed result.
+            layout = "stereo" if target.audio_channels != 1 else "mono"
+            rate = target.audio_sample_rate or 48000
+            args.extend(["-f", "lavfi", "-t", f"{duration:.6f}",
+                         "-i", f"anullsrc=channel_layout={layout}:sample_rate={rate}"])
+        # -t must land after every -i so ffmpeg reads it as an output option;
+        # placed before an input it would silently bound that input instead.
+        args.extend(["-t", f"{duration:.6f}", "-map", "0:v:0"])
+        for a in range(min(n_src_audio, n_want_audio)):
+            args.extend(["-map", f"0:a:{a}"])
+        for k in range(n_silent):
+            args.extend(["-map", f"{k + 1}:a:0"])
+        profile, pix_fmt = target.encode_profile
+        # Scale and pad to the target geometry rather than stretching, so a
+        # differently-shaped source keeps its aspect ratio, and force the
+        # target frame rate so the concatenated timeline stays monotonic.
+        vf = (f"scale={target.width}:{target.height}"
+              f":force_original_aspect_ratio=decrease,"
+              f"pad={target.width}:{target.height}:-1:-1,"
+              f"setsar=1,fps={target.fps:.6f}")
+        args.extend(["-vf", vf, "-c:v", "libx265",
+                     "-profile:v", profile, "-pix_fmt", pix_fmt,
+                     "-preset", self.preset, "-crf", str(self.crf)])
+        x265p = self._x265_params(target)
+        if x265p:
+            args.extend(["-x265-params", x265p])
+        # Audio is re-encoded too: a conformed span usually comes from a
+        # different capture whose codec/layout the target track cannot carry.
+        if n_want_audio:
+            args.extend(["-c:a", "aac", "-b:a", "192k"])
+        args.extend(["-map_metadata", "-1", "-map_chapters", "-1",
+                     "-f", "matroska", dst])
+        self.ff.run(args, step_cb=step_cb)
 
     def _save_impl(self, input_file, segments, output_file):
         self._report(0, "Probing source video...")
@@ -752,12 +1137,21 @@ class SmartSave10Bit:
                 parts.append(f"tail({fmt_time(p['tail'][0])}-{fmt_time(p['tail'][1])} re-enc)")
             log.info("Seg %d [%s-%s]: %s", i, fmt_time(seg.start), fmt_time(seg.end), " | ".join(parts))
 
-    def _process_one(self, input_file, info, plan, idx):
+    def _process_one(self, input_file, info, plan, idx, label=None):
+        """Produce the concat parts for one kept segment.
+
+        *idx* is the token used to name temp files and may be any string, so
+        the joiner can namespace parts per source file.  *label* is what the
+        progress log calls this segment, defaulting to the single-file
+        "Seg N" numbering.
+        """
         parts = []
         steps = [("head", plan["head"]), ("body", plan["body"]), ("tail", plan["tail"])]
         active = [(n, r) for n, r in steps if r is not None]
         if not active:
             return parts
+        if label is None:
+            label = f"Seg {idx + 1}" if isinstance(idx, int) else f"Seg {idx}"
         frame_dur = 1.0 / (info.fps or 24.0)
         for j, (name, (start, end)) in enumerate(active):
             step_dur = end - start
@@ -765,7 +1159,7 @@ class SmartSave10Bit:
             pct = self._step_base_pct
             out = os.path.join(self._temp_dir, f"seg{idx}_{name}.mkv")
             if name == "body":
-                self._report(pct, f"Seg {idx+1}: stream-copying {fmt_time(start)} - {fmt_time(end)}")
+                self._report(pct, f"{label}: stream-copying {fmt_time(start)} - {fmt_time(end)}")
                 self._stream_copy(input_file, start, end, out, info, step_cb=step_cb)
             else:
                 reencode_end = end
@@ -775,13 +1169,13 @@ class SmartSave10Bit:
                     # this, ffmpeg's -t may include the keyframe at exactly the
                     # boundary due to float-precision timestamp matching.
                     reencode_end = end - frame_dur / 2
-                self._report(pct, f"Seg {idx+1}: re-encoding {name} {fmt_time(start)} - {fmt_time(end)} (10-bit HEVC)")
+                self._report(pct, f"{label}: re-encoding {name} {fmt_time(start)} - {fmt_time(end)} (10-bit HEVC)")
                 self._reencode(input_file, start, reencode_end, out, info, step_cb=step_cb)
             self._finish_step(step_dur)
             if os.path.isfile(out) and os.path.getsize(out) > 0:
                 first_pts, last_pts = self._get_pts_range(out)
                 if first_pts is None:
-                    log.warning("Seg %d %s has no video packets, skipping", idx, name)
+                    log.warning("%s %s has no video packets, skipping", label, name)
                     continue
                 # Use actual PTS range for concat timing (not VPrj-derived
                 # estimates), so the concat demuxer places segments without
@@ -789,7 +1183,7 @@ class SmartSave10Bit:
                 actual_duration = last_pts - first_pts + frame_dur
                 parts.append((out, actual_duration, first_pts))
             else:
-                log.warning("Seg %d %s produced empty output", idx, name)
+                log.warning("%s %s produced empty output", label, name)
         return parts
 
     def _get_pts_range(self, path):
