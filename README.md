@@ -59,7 +59,10 @@ For each kept segment:
 |---|---|
 | `10bitRedo.pyw` | GUI launcher (double-click to run) |
 | `tenbitredo_engine.py` | Smart save engine — ffmpeg pipeline, VPrj parser, COM bridge |
+| `h264_smartcut.py` | `SmartCutH264`: smart save for H.264 sources, re-encoding boundaries with the source's own x264 settings so SPS/PPS match |
+| `lossless_cut.py` | Bit-exact cutting: snaps cuts to the nearest keyframe, stream-copies, verifies every video packet against the source |
 | `tests/test_smart_save.py` | 23 automated tests (boundaries, content verification, HDR) |
+| `tests/test_lossless_cut.py` | keyframe snapping and packet-exact tiling of the parts |
 | `tests/test_source.mkv` | 30-second 4K HEVC 10-bit test source |
 
 ## Tests
@@ -67,6 +70,7 @@ For each kept segment:
 ```bash
 cd Unofficial
 python -m pytest tests/test_smart_save.py -v
+python -m pytest tests/test_lossless_cut.py -v
 ```
 
 The test suite covers:
@@ -77,6 +81,27 @@ The test suite covers:
 - Frame-exact boundary verification (PTS monotonicity, no gaps, no duplicates, per-segment frame counts)
 - HDR metadata preservation
 - Visual content verification (MAE comparison against source at splice boundaries and stream-copy body)
+
+## H.264 sources
+
+`SmartSave10Bit` re-encodes boundaries in HEVC. For H.264 sources, `h264_smartcut.SmartCutH264` re-encodes
+them with libx264 instead, configured from the `x264 - core … options:` SEI the source carries, so the
+re-encoded spans get byte-identical SPS/PPS and splice cleanly with the copied packets.
+
+```bash
+python h264_smartcut.py source.mp4    # does an encode with the derived settings reproduce the SPS/PPS?
+```
+
+## Lossless (keyframe) cuts
+
+When not a single frame may be re-encoded, `lossless_cut.py` moves each cut to the nearest keyframe (usually
+well under a GOP away), splits with stream copy, and proves the parts are the source: the MD5 of every video
+packet in the parts, in order, must equal the source's.
+
+```bash
+python lossless_cut.py tape.mp4 1565.9 4198.2 --dry-run    # where would the cuts land?
+python lossless_cut.py tape.mp4 1565.9 4198.2 -o parts/
+```
 
 ## License
 
